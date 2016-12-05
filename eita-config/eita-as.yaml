@@ -1,0 +1,11 @@
+    id: eita-as
+    url: http://nextcloud.localhost/index.php/apps/cadernodecampo/matrix_api
+    as_token: as_token
+    hs_token: hs_token
+    sender_localpart: logging
+    namespaces:
+      users: [] 
+      rooms: [] 
+      aliases:
+        - exclusive: false
+          regex: ".*"
