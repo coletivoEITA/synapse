@@ -1,3 +1,419 @@
+Changes in synapse v0.21.0 (2017-05-18)
+=======================================
+
+No changes since v0.21.0-rc3
+
+
+Changes in synapse v0.21.0-rc3 (2017-05-17)
+===========================================
+
+Features:
+
+* Add per user rate-limiting overrides (PR #2208)
+* Add config option to limit maximum number of events requested by ``/sync``
+  and ``/messages`` (PR #2221) Thanks to @psaavedra!
+
+
+Changes:
+
+* Various small performance fixes (PR #2201, #2202, #2224, #2226, #2227, #2228,
+  #2229)
+* Update username availability checker API (PR #2209, #2213)
+* When purging, don't de-delta state groups we're about to delete (PR #2214)
+* Documentation to check synapse version (PR #2215) Thanks to @hamber-dick!
+* Add an index to event_search to speed up purge history API (PR #2218)
+
+
+Bug fixes:
+
+* Fix API to allow clients to upload one-time-keys with new sigs (PR #2206)
+
+
+Changes in synapse v0.21.0-rc2 (2017-05-08)
+===========================================
+
+Changes:
+
+* Always mark remotes as up if we receive a signed request from them (PR #2190)
+
+
+Bug fixes:
+
+* Fix bug where users got pushed for rooms they had muted (PR #2200)
+
+
+Changes in synapse v0.21.0-rc1 (2017-05-08)
+===========================================
+
+Features:
+
+* Add username availability checker API (PR #2183)
+* Add read marker API (PR #2120)
+
+
+Changes:
+
+* Enable guest access for the 3pl/3pid APIs (PR #1986)
+* Add setting to support TURN for guests (PR #2011)
+* Various performance improvements (PR #2075, #2076, #2080, #2083, #2108,
+  #2158, #2176, #2185)
+* Make synctl a bit more user friendly (PR #2078, #2127) Thanks @APwhitehat!
+* Replace HTTP replication with TCP replication (PR #2082, #2097, #2098,
+  #2099, #2103, #2014, #2016, #2115, #2116, #2117)
+* Support authenticated SMTP (PR #2102) Thanks @DanielDent!
+* Add a counter metric for successfully-sent transactions (PR #2121)
+* Propagate errors sensibly from proxied IS requests (PR #2147)
+* Add more granular event send metrics (PR #2178)
+
+
+
+Bug fixes:
+
+* Fix nuke-room script to work with current schema (PR #1927) Thanks
+  @zuckschwerdt!
+* Fix db port script to not assume postgres tables are in the public schema
+  (PR #2024) Thanks @jerrykan!
+* Fix getting latest device IP for user with no devices (PR #2118)
+* Fix rejection of invites to unreachable servers (PR #2145)
+* Fix code for reporting old verify keys in synapse (PR #2156)
+* Fix invite state to always include all events (PR #2163)
+* Fix bug where synapse would always fetch state for any missing event (PR #2170)
+* Fix a leak with timed out HTTP connections (PR #2180)
+* Fix bug where we didn't time out HTTP requests to ASes  (PR #2192)
+
+
+Docs:
+
+* Clarify doc for SQLite to PostgreSQL port (PR #1961) Thanks @benhylau!
+* Fix typo in synctl help (PR #2107) Thanks @HarHarLinks!
+* ``web_client_location`` documentation fix (PR #2131) Thanks @matthewjwolff!
+* Update README.rst with FreeBSD changes (PR #2132) Thanks @feld!
+* Clarify setting up metrics (PR #2149) Thanks @encks!
+
+
+Changes in synapse v0.20.0 (2017-04-11)
+=======================================
+
+Bug fixes:
+
+* Fix joining rooms over federation where not all servers in the room saw the
+  new server had joined (PR #2094)
+
+
+Changes in synapse v0.20.0-rc1 (2017-03-30)
+===========================================
+
+Features:
+
+* Add delete_devices API (PR #1993)
+* Add phone number registration/login support (PR #1994, #2055)
+
+
+Changes:
+
+* Use JSONSchema for validation of filters. Thanks @pik! (PR #1783)
+* Reread log config on SIGHUP (PR #1982)
+* Speed up public room list (PR #1989)
+* Add helpful texts to logger config options (PR #1990)
+* Minor ``/sync`` performance improvements. (PR #2002, #2013, #2022)
+* Add some debug to help diagnose weird federation issue (PR #2035)
+* Correctly limit retries for all federation requests (PR #2050, #2061)
+* Don't lock table when persisting new one time keys (PR #2053)
+* Reduce some CPU work on DB threads (PR #2054)
+* Cache hosts in room (PR #2060)
+* Batch sending of device list pokes (PR #2063)
+* Speed up persist event path in certain edge cases (PR #2070)
+
+
+Bug fixes:
+
+* Fix bug where current_state_events renamed to current_state_ids (PR #1849)
+* Fix routing loop when fetching remote media (PR #1992)
+* Fix current_state_events table to not lie (PR #1996)
+* Fix CAS login to handle PartialDownloadError (PR #1997)
+* Fix assertion to stop transaction queue getting wedged (PR #2010)
+* Fix presence to fallback to last_active_ts if it beats the last sync time.
+  Thanks @Half-Shot! (PR #2014)
+* Fix bug when federation received a PDU while a room join is in progress (PR
+  #2016)
+* Fix resetting state on rejected events (PR #2025)
+* Fix installation issues in readme. Thanks @ricco386 (PR #2037)
+* Fix caching of remote servers' signature keys (PR #2042)
+* Fix some leaking log context (PR #2048, #2049, #2057, #2058)
+* Fix rejection of invites not reaching sync (PR #2056)
+
+
+
+Changes in synapse v0.19.3 (2017-03-20)
+=======================================
+
+No changes since v0.19.3-rc2
+
+
+Changes in synapse v0.19.3-rc2 (2017-03-13)
+===========================================
+
+Bug fixes:
+
+* Fix bug in handling of incoming device list updates over federation.
+
+
+
+Changes in synapse v0.19.3-rc1 (2017-03-08)
+===========================================
+
+Features:
+
+* Add some administration functionalities. Thanks to morteza-araby! (PR #1784)
+
+
+Changes:
+
+* Reduce database table sizes (PR #1873, #1916, #1923, #1963)
+* Update contrib/ to not use syutil. Thanks to andrewshadura! (PR #1907)
+* Don't fetch current state when sending an event in common case (PR #1955)
+
+
+Bug fixes:
+
+* Fix synapse_port_db failure. Thanks to Pneumaticat! (PR #1904)
+* Fix caching to not cache error responses (PR #1913)
+* Fix APIs to make kick & ban reasons work (PR #1917)
+* Fix bugs in the /keys/changes api (PR #1921)
+* Fix bug where users couldn't forget rooms they were banned from (PR #1922)
+* Fix issue with long language values in pushers API (PR #1925)
+* Fix a race in transaction queue (PR #1930)
+* Fix dynamic thumbnailing to preserve aspect ratio. Thanks to jkolo! (PR
+  #1945)
+* Fix device list update to not constantly resync (PR #1964)
+* Fix potential for huge memory usage when getting device that have
+  changed (PR #1969)
+
+
+
+Changes in synapse v0.19.2 (2017-02-20)
+=======================================
+
+* Fix bug with event visibility check in /context/ API. Thanks to Tokodomo for
+  pointing it out! (PR #1929)
+
+
+Changes in synapse v0.19.1 (2017-02-09)
+=======================================
+
+* Fix bug where state was incorrectly reset in a room when synapse received an
+  event over federation that did not pass auth checks (PR #1892)
+
+
+Changes in synapse v0.19.0 (2017-02-04)
+=======================================
+
+No changes since RC 4.
+
+
+Changes in synapse v0.19.0-rc4 (2017-02-02)
+===========================================
+
+* Bump cache sizes for common membership queries (PR #1879)
+
+
+Changes in synapse v0.19.0-rc3 (2017-02-02)
+===========================================
+
+* Fix email push in pusher worker (PR #1875)
+* Make presence.get_new_events a bit faster (PR #1876)
+* Make /keys/changes a bit more performant (PR #1877)
+
+
+Changes in synapse v0.19.0-rc2 (2017-02-02)
+===========================================
+
+* Include newly joined users in /keys/changes API (PR #1872)
+
+
+Changes in synapse v0.19.0-rc1 (2017-02-02)
+===========================================
+
+Features:
+
+* Add support for specifying multiple bind addresses (PR #1709, #1712, #1795,
+  #1835). Thanks to @kyrias!
+* Add /account/3pid/delete endpoint (PR #1714)
+* Add config option to configure the Riot URL used in notification emails (PR
+  #1811). Thanks to @aperezdc!
+* Add username and password config options for turn server (PR #1832). Thanks
+  to @xsteadfastx!
+* Implement device lists updates over federation (PR #1857, #1861, #1864)
+* Implement /keys/changes (PR #1869, #1872)
+
+
+Changes:
+
+* Improve IPv6 support (PR #1696). Thanks to @kyrias and @glyph!
+* Log which files we saved attachments to in the media_repository (PR #1791)
+* Linearize updates to membership via PUT /state/ to better handle multiple
+  joins (PR #1787)
+* Limit number of entries to prefill from cache on startup (PR #1792)
+* Remove full_twisted_stacktraces option (PR #1802)
+* Measure size of some caches by sum of the size of cached values (PR #1815)
+* Measure metrics of string_cache (PR #1821)
+* Reduce logging verbosity (PR #1822, #1823, #1824)
+* Don't clobber a displayname or avatar_url if provided by an m.room.member
+  event (PR #1852)
+* Better handle 401/404 response for federation /send/ (PR #1866, #1871)
+
+
+Fixes:
+
+* Fix ability to change password to a non-ascii one (PR #1711)
+* Fix push getting stuck due to looking at the wrong view of state (PR #1820)
+* Fix email address comparison to be case insensitive (PR #1827)
+* Fix occasional inconsistencies of room membership (PR #1836, #1840)
+
+
+Performance:
+
+* Don't block messages sending on bumping presence (PR #1789)
+* Change device_inbox stream index to include user (PR #1793)
+* Optimise state resolution (PR #1818)
+* Use DB cache of joined users for presence (PR #1862)
+* Add an index to make membership queries faster (PR #1867)
+
+
+Changes in synapse v0.18.7 (2017-01-09)
+=======================================
+
+No changes from v0.18.7-rc2
+
+
+Changes in synapse v0.18.7-rc2 (2017-01-07)
+===========================================
+
+Bug fixes:
+
+* Fix error in rc1's discarding invalid inbound traffic logic that was
+  incorrectly discarding missing events
+
+
+Changes in synapse v0.18.7-rc1 (2017-01-06)
+===========================================
+
+Bug fixes:
+
+* Fix error in #PR 1764 to actually fix the nightmare #1753 bug.
+* Improve deadlock logging further
+* Discard inbound federation traffic from invalid domains, to immunise
+  against #1753
+
+
+Changes in synapse v0.18.6 (2017-01-06)
+=======================================
+
+Bug fixes:
+
+* Fix bug when checking if a guest user is allowed to join a room (PR #1772)
+  Thanks to Patrik Oldsberg for diagnosing and the fix!
+
+
+Changes in synapse v0.18.6-rc3 (2017-01-05)
+===========================================
+
+Bug fixes:
+
+* Fix bug where we failed to send ban events to the banned server (PR #1758)
+* Fix bug where we sent event that didn't originate on this server to
+  other servers (PR #1764)
+* Fix bug where processing an event from a remote server took a long time
+  because we were making long HTTP requests (PR #1765, PR #1744)
+
+Changes:
+
+* Improve logging for debugging deadlocks (PR #1766, PR #1767)
+
+
+Changes in synapse v0.18.6-rc2 (2016-12-30)
+===========================================
+
+Bug fixes:
+
+* Fix memory leak in twisted by initialising logging correctly (PR #1731)
+* Fix bug where fetching missing events took an unacceptable amount of time in
+  large rooms (PR #1734)
+
+
+Changes in synapse v0.18.6-rc1 (2016-12-29)
+===========================================
+
+Bug fixes:
+
+* Make sure that outbound connections are closed (PR #1725)
+
+
+Changes in synapse v0.18.5 (2016-12-16)
+=======================================
+
+Bug fixes:
+
+* Fix federation /backfill returning events it shouldn't (PR #1700)
+* Fix crash in url preview (PR #1701)
+
+
+Changes in synapse v0.18.5-rc3 (2016-12-13)
+===========================================
+
+Features:
+
+* Add support for E2E for guests (PR #1653)
+* Add new API appservice specific public room list (PR #1676)
+* Add new room membership APIs (PR #1680)
+
+
+Changes:
+
+* Enable guest access for private rooms by default (PR #653)
+* Limit the number of events that can be created on a given room concurrently
+  (PR #1620)
+* Log the args that we have on UI auth completion (PR #1649)
+* Stop generating refresh_tokens (PR #1654)
+* Stop putting a time caveat on access tokens (PR #1656)
+* Remove unspecced GET endpoints for e2e keys (PR #1694)
+
+
+Bug fixes:
+
+* Fix handling of 500 and 429's over federation (PR #1650)
+* Fix Content-Type header parsing (PR #1660)
+* Fix error when previewing sites that include unicode, thanks to kyrias (PR
+  #1664)
+* Fix some cases where we drop read receipts (PR #1678)
+* Fix bug where calls to ``/sync`` didn't correctly timeout (PR #1683)
+* Fix bug where E2E key query would fail if a single remote host failed (PR
+  #1686)
+
+
+
+Changes in synapse v0.18.5-rc2 (2016-11-24)
+===========================================
+
+Bug fixes:
+
+* Don't send old events over federation, fixes bug in -rc1.
+
+Changes in synapse v0.18.5-rc1 (2016-11-24)
+===========================================
+
+Features:
+
+* Implement "event_fields" in filters (PR #1638)
+
+Changes:
+
+* Use external ldap auth pacakge (PR #1628)
+* Split out federation transaction sending to a worker (PR #1635)
+* Fail with a coherent error message if `/sync?filter=` is invalid (PR #1636)
+* More efficient notif count queries (PR #1644)
+
+
 Changes in synapse v0.18.4 (2016-11-22)
 =======================================
 

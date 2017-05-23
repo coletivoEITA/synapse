@@ -24,7 +24,6 @@ from synapse.types import UserID, get_domain_from_id
 import logging
 
 from collections import namedtuple
-import ujson as json
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +54,9 @@ class TypingHandler(object):
         self.clock = hs.get_clock()
         self.wheel_timer = WheelTimer(bucket_size=5000)
 
-        self.federation = hs.get_replication_layer()
+        self.federation = hs.get_federation_sender()
 
-        self.federation.register_edu_handler("m.typing", self._recv_edu)
+        hs.get_replication_layer().register_edu_handler("m.typing", self._recv_edu)
 
         hs.get_distributor().observe("user_left_room", self.user_left_room)
 
@@ -288,10 +287,12 @@ class TypingHandler(object):
         for room_id, serial in self._room_serials.items():
             if last_id < serial and serial <= current_id:
                 typing = self._room_typing[room_id]
-                typing_bytes = json.dumps(list(typing), ensure_ascii=False)
-                rows.append((serial, room_id, typing_bytes))
+                rows.append((serial, room_id, list(typing)))
         rows.sort()
         return rows
+
+    def get_current_token(self):
+        return self._latest_room_serial
 
 
 class TypingNotificationEventSource(object):

@@ -15,14 +15,13 @@
 
 from ._base import Config
 from synapse.util.logcontext import LoggingContextFilter
-from twisted.python.log import PythonLoggingObserver
+from twisted.logger import globalLogBeginner, STDLibLogObserver
 import logging
 import logging.config
 import yaml
 from string import Template
 import os
 import signal
-from synapse.util.debug import debug_deferreds
 
 
 DEFAULT_LOG_CONFIG = Template("""
@@ -46,16 +45,18 @@ handlers:
     maxBytes: 104857600
     backupCount: 10
     filters: [context]
-    level: INFO
   console:
     class: logging.StreamHandler
     formatter: precise
+    filters: [context]
 
 loggers:
     synapse:
         level: INFO
 
     synapse.storage.SQL:
+        # beware: increasing this to DEBUG will make synapse log sensitive
+        # information such as access tokens.
         level: INFO
 
 root:
@@ -68,10 +69,9 @@ class LoggingConfig(Config):
 
     def read_config(self, config):
         self.verbosity = config.get("verbose", 0)
+        self.no_redirect_stdio = config.get("no_redirect_stdio", False)
         self.log_config = self.abspath(config.get("log_config"))
         self.log_file = self.abspath(config.get("log_file"))
-        if config.get("full_twisted_stacktraces"):
-            debug_deferreds()
 
     def default_config(self, config_dir_path, server_name, **kwargs):
         log_file = self.abspath("homeserver.log")
@@ -79,24 +79,21 @@ class LoggingConfig(Config):
             os.path.join(config_dir_path, server_name + ".log.config")
         )
         return """
-        # Logging verbosity level.
+        # Logging verbosity level. Ignored if log_config is specified.
         verbose: 0
 
-        # File to write logging to
+        # File to write logging to. Ignored if log_config is specified.
         log_file: "%(log_file)s"
 
         # A yaml python logging config file
         log_config: "%(log_config)s"
-
-        # Stop twisted from discarding the stack traces of exceptions in
-        # deferreds by waiting a reactor tick before running a deferred's
-        # callbacks.
-        # full_twisted_stacktraces: true
         """ % locals()
 
     def read_arguments(self, args):
         if args.verbose is not None:
             self.verbosity = args.verbose
+        if args.no_redirect_stdio is not None:
+            self.no_redirect_stdio = args.no_redirect_stdio
         if args.log_config is not None:
             self.log_config = args.log_config
         if args.log_file is not None:
@@ -106,15 +103,21 @@ class LoggingConfig(Config):
         logging_group = parser.add_argument_group("logging")
         logging_group.add_argument(
             '-v', '--verbose', dest="verbose", action='count',
-            help="The verbosity level."
+            help="The verbosity level. Specify multiple times to increase "
+            "verbosity. (Ignored if --log-config is specified.)"
         )
         logging_group.add_argument(
             '-f', '--log-file', dest="log_file",
-            help="File to log to."
+            help="File to log to. (Ignored if --log-config is specified.)"
         )
         logging_group.add_argument(
             '--log-config', dest="log_config", default=None,
             help="Python logging config file"
+        )
+        logging_group.add_argument(
+            '-n', '--no-redirect-stdio',
+            action='store_true', default=None,
+            help="Do not redirect stdout/stderr to the log"
         )
 
     def generate_files(self, config):
@@ -125,11 +128,22 @@ class LoggingConfig(Config):
                     DEFAULT_LOG_CONFIG.substitute(log_file=config["log_file"])
                 )
 
-    def setup_logging(self):
-        setup_logging(self.log_config, self.log_file, self.verbosity)
 
+def setup_logging(config, use_worker_options=False):
+    """ Set up python logging
 
-def setup_logging(log_config=None, log_file=None, verbosity=None):
+    Args:
+        config (LoggingConfig | synapse.config.workers.WorkerConfig):
+            configuration data
+
+        use_worker_options (bool): True to use 'worker_log_config' and
+            'worker_log_file' options instead of 'log_config' and 'log_file'.
+    """
+    log_config = (config.worker_log_config if use_worker_options
+                  else config.log_config)
+    log_file = (config.worker_log_file if use_worker_options
+                else config.log_file)
+
     log_format = (
         "%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s"
         " - %(message)s"
@@ -138,9 +152,9 @@ def setup_logging(log_config=None, log_file=None, verbosity=None):
 
         level = logging.INFO
         level_for_storage = logging.INFO
-        if verbosity:
+        if config.verbosity:
             level = logging.DEBUG
-            if verbosity > 1:
+            if config.verbosity > 1:
                 level_for_storage = logging.DEBUG
 
         # FIXME: we need a logging.WARN for a -q quiet option
@@ -160,14 +174,6 @@ def setup_logging(log_config=None, log_file=None, verbosity=None):
                 logger.info("Closing log file due to SIGHUP")
                 handler.doRollover()
                 logger.info("Opened new log file due to SIGHUP")
-
-            # TODO(paul): obviously this is a terrible mechanism for
-            #   stealing SIGHUP, because it means no other part of synapse
-            #   can use it instead. If we want to catch SIGHUP anywhere
-            #   else as well, I'd suggest we find a nicer way to broadcast
-            #   it around.
-            if getattr(signal, "SIGHUP"):
-                signal.signal(signal.SIGHUP, sighup)
         else:
             handler = logging.StreamHandler()
         handler.setFormatter(formatter)
@@ -176,8 +182,38 @@ def setup_logging(log_config=None, log_file=None, verbosity=None):
 
         logger.addHandler(handler)
     else:
-        with open(log_config, 'r') as f:
-            logging.config.dictConfig(yaml.load(f))
+        def load_log_config():
+            with open(log_config, 'r') as f:
+                logging.config.dictConfig(yaml.load(f))
 
-    observer = PythonLoggingObserver()
-    observer.start()
+        def sighup(signum, stack):
+            # it might be better to use a file watcher or something for this.
+            logging.info("Reloading log config from %s due to SIGHUP",
+                         log_config)
+            load_log_config()
+
+        load_log_config()
+
+    # TODO(paul): obviously this is a terrible mechanism for
+    #   stealing SIGHUP, because it means no other part of synapse
+    #   can use it instead. If we want to catch SIGHUP anywhere
+    #   else as well, I'd suggest we find a nicer way to broadcast
+    #   it around.
+    if getattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, sighup)
+
+    # It's critical to point twisted's internal logging somewhere, otherwise it
+    # stacks up and leaks kup to 64K object;
+    # see: https://twistedmatrix.com/trac/ticket/8164
+    #
+    # Routing to the python logging framework could be a performance problem if
+    # the handlers blocked for a long time as python.logging is a blocking API
+    # see https://twistedmatrix.com/documents/current/core/howto/logger.html
+    # filed as https://github.com/matrix-org/synapse/issues/1727
+    #
+    # However this may not be too much of a problem if we are just writing to a file.
+    observer = STDLibLogObserver()
+    globalLogBeginner.beginLoggingTo(
+        [observer],
+        redirectStandardIO=not config.no_redirect_stdio,
+    )

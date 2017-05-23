@@ -78,12 +78,16 @@ def parse_boolean(request, name, default=None, required=False):
             parameter is present and not one of "true" or "false".
     """
 
-    if name in request.args:
+    return parse_boolean_from_args(request.args, name, default, required)
+
+
+def parse_boolean_from_args(args, name, default=None, required=False):
+    if name in args:
         try:
             return {
                 "true": True,
                 "false": False,
-            }[request.args[name][0]]
+            }[args[name][0]]
         except:
             message = (
                 "Boolean query parameter %r must be one of"
@@ -186,6 +190,16 @@ def parse_json_object_from_request(request):
         raise SynapseError(400, message, errcode=Codes.BAD_JSON)
 
     return content
+
+
+def assert_params_in_request(body, required):
+    absent = []
+    for k in required:
+        if k not in body:
+            absent.append(k)
+
+    if len(absent) > 0:
+        raise SynapseError(400, "Missing params: %r" % absent, Codes.MISSING_PARAM)
 
 
 class RestServlet(object):

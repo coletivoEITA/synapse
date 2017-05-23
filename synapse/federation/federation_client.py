@@ -18,7 +18,6 @@ from twisted.internet import defer
 
 from .federation_base import FederationBase
 from synapse.api.constants import Membership
-from .units import Edu
 
 from synapse.api.errors import (
     CodeMessageException, HttpResponseException, SynapseError,
@@ -27,11 +26,10 @@ from synapse.util import unwrapFirstError
 from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.logutils import log_function
 from synapse.util.logcontext import preserve_fn, preserve_context_over_deferred
-from synapse.events import FrozenEvent
-from synapse.types import get_domain_from_id
+from synapse.events import FrozenEvent, builder
 import synapse.metrics
 
-from synapse.util.retryutils import get_retry_limiter, NotRetryingDestination
+from synapse.util.retryutils import NotRetryingDestination
 
 import copy
 import itertools
@@ -44,10 +42,6 @@ logger = logging.getLogger(__name__)
 
 # synapse.federation.federation_client is a silly name
 metrics = synapse.metrics.get_metrics_for("synapse.federation.client")
-
-sent_pdus_destination_dist = metrics.register_distribution("sent_pdu_destinations")
-
-sent_edus_counter = metrics.register_counter("sent_edus")
 
 sent_queries_counter = metrics.register_counter("sent_queries", labels=["type"])
 
@@ -93,65 +87,8 @@ class FederationClient(FederationBase):
         self._get_pdu_cache.start()
 
     @log_function
-    def send_pdu(self, pdu, destinations):
-        """Informs the replication layer about a new PDU generated within the
-        home server that should be transmitted to others.
-
-        TODO: Figure out when we should actually resolve the deferred.
-
-        Args:
-            pdu (Pdu): The new Pdu.
-
-        Returns:
-            Deferred: Completes when we have successfully processed the PDU
-            and replicated it to any interested remote home servers.
-        """
-        order = self._order
-        self._order += 1
-
-        sent_pdus_destination_dist.inc_by(len(destinations))
-
-        logger.debug("[%s] transaction_layer.enqueue_pdu... ", pdu.event_id)
-
-        # TODO, add errback, etc.
-        self._transaction_queue.enqueue_pdu(pdu, destinations, order)
-
-        logger.debug(
-            "[%s] transaction_layer.enqueue_pdu... done",
-            pdu.event_id
-        )
-
-    def send_presence(self, destination, states):
-        if destination != self.server_name:
-            self._transaction_queue.enqueue_presence(destination, states)
-
-    @log_function
-    def send_edu(self, destination, edu_type, content, key=None):
-        edu = Edu(
-            origin=self.server_name,
-            destination=destination,
-            edu_type=edu_type,
-            content=content,
-        )
-
-        sent_edus_counter.inc()
-
-        self._transaction_queue.enqueue_edu(edu, key=key)
-
-    @log_function
-    def send_device_messages(self, destination):
-        """Sends the device messages in the local database to the remote
-        destination"""
-        self._transaction_queue.enqueue_device_messages(destination)
-
-    @log_function
-    def send_failure(self, failure, destination):
-        self._transaction_queue.enqueue_failure(failure, destination)
-        return defer.succeed(None)
-
-    @log_function
     def make_query(self, destination, query_type, args,
-                   retry_on_dns_fail=False):
+                   retry_on_dns_fail=False, ignore_backoff=False):
         """Sends a federation Query to a remote homeserver of the given type
         and arguments.
 
@@ -161,6 +98,8 @@ class FederationClient(FederationBase):
                 handler name used in register_query_handler().
             args (dict): Mapping of strings to strings containing the details
                 of the query request.
+            ignore_backoff (bool): true to ignore the historical backoff data
+                and try the request anyway.
 
         Returns:
             a Deferred which will eventually yield a JSON object from the
@@ -169,7 +108,8 @@ class FederationClient(FederationBase):
         sent_queries_counter.inc(query_type)
 
         return self.transport_layer.make_query(
-            destination, query_type, args, retry_on_dns_fail=retry_on_dns_fail
+            destination, query_type, args, retry_on_dns_fail=retry_on_dns_fail,
+            ignore_backoff=ignore_backoff,
         )
 
     @log_function
@@ -187,6 +127,16 @@ class FederationClient(FederationBase):
         sent_queries_counter.inc("client_device_keys")
         return self.transport_layer.query_client_keys(
             destination, content, timeout
+        )
+
+    @log_function
+    def query_user_devices(self, destination, user_id, timeout=30000):
+        """Query the device keys for a list of user ids hosted on a remote
+        server.
+        """
+        sent_queries_counter.inc("user_devices")
+        return self.transport_layer.query_user_devices(
+            destination, user_id, timeout
         )
 
     @log_function
@@ -259,8 +209,7 @@ class FederationClient(FederationBase):
 
         Args:
             destinations (list): Which home servers to query
-            pdu_origin (str): The home server that originally sent the pdu.
-            event_id (str)
+            event_id (str): event to fetch
             outlier (bool): Indicates whether the PDU is an `outlier`, i.e. if
                 it's from an arbitary point in the context as opposed to part
                 of the current block of PDUs. Defaults to `False`
@@ -288,31 +237,24 @@ class FederationClient(FederationBase):
                 continue
 
             try:
-                limiter = yield get_retry_limiter(
-                    destination,
-                    self._clock,
-                    self.store,
+                transaction_data = yield self.transport_layer.get_event(
+                    destination, event_id, timeout=timeout,
                 )
 
-                with limiter:
-                    transaction_data = yield self.transport_layer.get_event(
-                        destination, event_id, timeout=timeout,
-                    )
+                logger.debug("transaction_data %r", transaction_data)
 
-                    logger.debug("transaction_data %r", transaction_data)
+                pdu_list = [
+                    self.event_from_pdu_json(p, outlier=outlier)
+                    for p in transaction_data["pdus"]
+                ]
 
-                    pdu_list = [
-                        self.event_from_pdu_json(p, outlier=outlier)
-                        for p in transaction_data["pdus"]
-                    ]
+                if pdu_list and pdu_list[0]:
+                    pdu = pdu_list[0]
 
-                    if pdu_list and pdu_list[0]:
-                        pdu = pdu_list[0]
+                    # Check signatures are correct.
+                    signed_pdu = yield self._check_sigs_and_hashes([pdu])[0]
 
-                        # Check signatures are correct.
-                        signed_pdu = yield self._check_sigs_and_hashes([pdu])[0]
-
-                        break
+                    break
 
                 pdu_attempts[destination] = now
 
@@ -532,8 +474,13 @@ class FederationClient(FederationBase):
             content (object): Any additional data to put into the content field
                 of the event.
         Return:
-            A tuple of (origin (str), event (object)) where origin is the remote
-            homeserver which generated the event.
+            Deferred: resolves to a tuple of (origin (str), event (object))
+            where origin is the remote homeserver which generated the event.
+
+            Fails with a ``CodeMessageException`` if the chosen remote server
+            returns a 300/400 code.
+
+            Fails with a ``RuntimeError`` if no servers were reachable.
         """
         valid_memberships = {Membership.JOIN, Membership.LEAVE}
         if membership not in valid_memberships:
@@ -562,8 +509,10 @@ class FederationClient(FederationBase):
                 if "prev_state" not in pdu_dict:
                     pdu_dict["prev_state"] = []
 
+                ev = builder.EventBuilder(pdu_dict)
+
                 defer.returnValue(
-                    (destination, self.event_from_pdu_json(pdu_dict))
+                    (destination, ev)
                 )
                 break
             except CodeMessageException as e:
@@ -584,6 +533,27 @@ class FederationClient(FederationBase):
 
     @defer.inlineCallbacks
     def send_join(self, destinations, pdu):
+        """Sends a join event to one of a list of homeservers.
+
+        Doing so will cause the remote server to add the event to the graph,
+        and send the event out to the rest of the federation.
+
+        Args:
+            destinations (str): Candidate homeservers which are probably
+                participating in the room.
+            pdu (BaseEvent): event to be sent
+
+        Return:
+            Deferred: resolves to a dict with members ``origin`` (a string
+            giving the serer the event was sent to, ``state`` (?) and
+            ``auth_chain``.
+
+            Fails with a ``CodeMessageException`` if the chosen remote server
+            returns a 300/400 code.
+
+            Fails with a ``RuntimeError`` if no servers were reachable.
+        """
+
         for destination in destinations:
             if destination == self.server_name:
                 continue
@@ -691,6 +661,26 @@ class FederationClient(FederationBase):
 
     @defer.inlineCallbacks
     def send_leave(self, destinations, pdu):
+        """Sends a leave event to one of a list of homeservers.
+
+        Doing so will cause the remote server to add the event to the graph,
+        and send the event out to the rest of the federation.
+
+        This is mostly useful to reject received invites.
+
+        Args:
+            destinations (str): Candidate homeservers which are probably
+                participating in the room.
+            pdu (BaseEvent): event to be sent
+
+        Return:
+            Deferred: resolves to None.
+
+            Fails with a ``CodeMessageException`` if the chosen remote server
+            returns a non-200 code.
+
+            Fails with a ``RuntimeError`` if no servers were reachable.
+        """
         for destination in destinations:
             if destination == self.server_name:
                 continue
@@ -717,12 +707,15 @@ class FederationClient(FederationBase):
         raise RuntimeError("Failed to send to any server.")
 
     def get_public_rooms(self, destination, limit=None, since_token=None,
-                         search_filter=None):
+                         search_filter=None, include_all_networks=False,
+                         third_party_instance_id=None):
         if destination == self.server_name:
             return
 
         return self.transport_layer.get_public_rooms(
-            destination, limit, since_token, search_filter
+            destination, limit, since_token, search_filter,
+            include_all_networks=include_all_networks,
+            third_party_instance_id=third_party_instance_id,
         )
 
     @defer.inlineCallbacks
@@ -767,7 +760,7 @@ class FederationClient(FederationBase):
 
     @defer.inlineCallbacks
     def get_missing_events(self, destination, room_id, earliest_events_ids,
-                           latest_events, limit, min_depth):
+                           latest_events, limit, min_depth, timeout):
         """Tries to fetch events we are missing. This is called when we receive
         an event without having received all of its ancestors.
 
@@ -781,6 +774,7 @@ class FederationClient(FederationBase):
                 have all previous events for.
             limit (int): Maximum number of events to return.
             min_depth (int): Minimum depth of events tor return.
+            timeout (int): Max time to wait in ms
         """
         try:
             content = yield self.transport_layer.get_missing_events(
@@ -790,6 +784,7 @@ class FederationClient(FederationBase):
                 latest_events=[e.event_id for e in latest_events],
                 limit=limit,
                 min_depth=min_depth,
+                timeout=timeout,
             )
 
             events = [
@@ -800,8 +795,6 @@ class FederationClient(FederationBase):
             signed_events = yield self._check_sigs_and_hash_and_fetch(
                 destination, events, outlier=False
             )
-
-            have_gotten_all_from_destination = True
         except HttpResponseException as e:
             if not e.code == 400:
                 raise
@@ -809,72 +802,6 @@ class FederationClient(FederationBase):
             # We are probably hitting an old server that doesn't support
             # get_missing_events
             signed_events = []
-            have_gotten_all_from_destination = False
-
-        if len(signed_events) >= limit:
-            defer.returnValue(signed_events)
-
-        users = yield self.state.get_current_user_in_room(room_id)
-        servers = set(get_domain_from_id(u) for u in users)
-
-        servers = set(servers)
-        servers.discard(self.server_name)
-
-        failed_to_fetch = set()
-
-        while len(signed_events) < limit:
-            # Are we missing any?
-
-            seen_events = set(earliest_events_ids)
-            seen_events.update(e.event_id for e in signed_events if e)
-
-            missing_events = {}
-            for e in itertools.chain(latest_events, signed_events):
-                if e.depth > min_depth:
-                    missing_events.update({
-                        e_id: e.depth for e_id, _ in e.prev_events
-                        if e_id not in seen_events
-                        and e_id not in failed_to_fetch
-                    })
-
-            if not missing_events:
-                break
-
-            have_seen = yield self.store.have_events(missing_events)
-
-            for k in have_seen:
-                missing_events.pop(k, None)
-
-            if not missing_events:
-                break
-
-            # Okay, we haven't gotten everything yet. Lets get them.
-            ordered_missing = sorted(missing_events.items(), key=lambda x: x[0])
-
-            if have_gotten_all_from_destination:
-                servers.discard(destination)
-
-            def random_server_list():
-                srvs = list(servers)
-                random.shuffle(srvs)
-                return srvs
-
-            deferreds = [
-                preserve_fn(self.get_pdu)(
-                    destinations=random_server_list(),
-                    event_id=e_id,
-                )
-                for e_id, depth in ordered_missing[:limit - len(signed_events)]
-            ]
-
-            res = yield preserve_context_over_deferred(
-                defer.DeferredList(deferreds, consumeErrors=True)
-            )
-            for (result, val), (e_id, _) in zip(res, ordered_missing):
-                if result and val:
-                    signed_events.append(val)
-                else:
-                    failed_to_fetch.add(e_id)
 
         defer.returnValue(signed_events)
 

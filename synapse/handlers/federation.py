@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Contains handlers for federation events."""
+import synapse.util.logcontext
 from signedjson.key import decode_verify_key_bytes
 from signedjson.sign import verify_signed_json
 from unpaddedbase64 import decode_base64
@@ -27,11 +28,11 @@ from synapse.api.constants import EventTypes, Membership, RejectedReason
 from synapse.events.validator import EventValidator
 from synapse.util import unwrapFirstError
 from synapse.util.logcontext import (
-    PreserveLoggingContext, preserve_fn, preserve_context_over_deferred
+    preserve_fn, preserve_context_over_deferred
 )
 from synapse.util.metrics import measure_func
 from synapse.util.logutils import log_function
-from synapse.util.async import run_on_reactor
+from synapse.util.async import run_on_reactor, Linearizer
 from synapse.util.frozenutils import unfreeze
 from synapse.crypto.event_signing import (
     compute_event_signature, add_hashes_and_signatures,
@@ -79,45 +80,227 @@ class FederationHandler(BaseHandler):
 
         # When joining a room we need to queue any events for that room up
         self.room_queues = {}
+        self._room_pdu_linearizer = Linearizer("fed_room_pdu")
 
-    def handle_new_event(self, event, destinations):
-        """ Takes in an event from the client to server side, that has already
-        been authed and handled by the state module, and sends it to any
-        remote home servers that may be interested.
+    @defer.inlineCallbacks
+    @log_function
+    def on_receive_pdu(self, origin, pdu, get_missing=True):
+        """ Process a PDU received via a federation /send/ transaction, or
+        via backfill of missing prev_events
 
         Args:
-            event: The event to send
-            destinations: A list of destinations to send it to
+            origin (str): server which initiated the /send/ transaction. Will
+                be used to fetch missing events or state.
+            pdu (FrozenEvent): received PDU
+            get_missing (bool): True if we should fetch missing prev_events
 
-        Returns:
-            Deferred: Resolved when it has successfully been queued for
-            processing.
+        Returns (Deferred): completes with None
         """
 
-        return self.replication_layer.send_pdu(event, destinations)
+        # We reprocess pdus when we have seen them only as outliers
+        existing = yield self.get_persisted_pdu(
+            origin, pdu.event_id, do_auth=False
+        )
 
-    @log_function
-    @defer.inlineCallbacks
-    def on_receive_pdu(self, origin, pdu, state=None, auth_chain=None):
-        """ Called by the ReplicationLayer when we have a new pdu. We need to
-        do auth checks and put it through the StateHandler.
+        # FIXME: Currently we fetch an event again when we already have it
+        # if it has been marked as an outlier.
 
-        auth_chain and state are None if we already have the necessary state
-        and prev_events in the db
-        """
-        event = pdu
-
-        logger.debug("Got event: %s", event.event_id)
+        already_seen = (
+            existing and (
+                not existing.internal_metadata.is_outlier()
+                or pdu.internal_metadata.is_outlier()
+            )
+        )
+        if already_seen:
+            logger.debug("Already seen pdu %s", pdu.event_id)
+            return
 
         # If we are currently in the process of joining this room, then we
         # queue up events for later processing.
-        if event.room_id in self.room_queues:
-            self.room_queues[event.room_id].append((pdu, origin))
+        if pdu.room_id in self.room_queues:
+            logger.info("Ignoring PDU %s for room %s from %s for now; join "
+                        "in progress", pdu.event_id, pdu.room_id, origin)
+            self.room_queues[pdu.room_id].append((pdu, origin))
             return
 
-        logger.debug("Processing event: %s", event.event_id)
+        state = None
 
-        logger.debug("Event: %s", event)
+        auth_chain = []
+
+        have_seen = yield self.store.have_events(
+            [ev for ev, _ in pdu.prev_events]
+        )
+
+        fetch_state = False
+
+        # Get missing pdus if necessary.
+        if not pdu.internal_metadata.is_outlier():
+            # We only backfill backwards to the min depth.
+            min_depth = yield self.get_min_depth_for_context(
+                pdu.room_id
+            )
+
+            logger.debug(
+                "_handle_new_pdu min_depth for %s: %d",
+                pdu.room_id, min_depth
+            )
+
+            prevs = {e_id for e_id, _ in pdu.prev_events}
+            seen = set(have_seen.keys())
+
+            if min_depth and pdu.depth < min_depth:
+                # This is so that we don't notify the user about this
+                # message, to work around the fact that some events will
+                # reference really really old events we really don't want to
+                # send to the clients.
+                pdu.internal_metadata.outlier = True
+            elif min_depth and pdu.depth > min_depth:
+                if get_missing and prevs - seen:
+                    # If we're missing stuff, ensure we only fetch stuff one
+                    # at a time.
+                    logger.info(
+                        "Acquiring lock for room %r to fetch %d missing events: %r...",
+                        pdu.room_id, len(prevs - seen), list(prevs - seen)[:5],
+                    )
+                    with (yield self._room_pdu_linearizer.queue(pdu.room_id)):
+                        logger.info(
+                            "Acquired lock for room %r to fetch %d missing events",
+                            pdu.room_id, len(prevs - seen),
+                        )
+
+                        yield self._get_missing_events_for_pdu(
+                            origin, pdu, prevs, min_depth
+                        )
+
+                        # Update the set of things we've seen after trying to
+                        # fetch the missing stuff
+                        have_seen = yield self.store.have_events(prevs)
+                        seen = set(have_seen.iterkeys())
+
+                        if not prevs - seen:
+                            logger.info(
+                                "Found all missing prev events for %s", pdu.event_id
+                            )
+                elif prevs - seen:
+                    logger.info(
+                        "Not fetching %d missing events for room %r,event %s: %r...",
+                        len(prevs - seen), pdu.room_id, pdu.event_id,
+                        list(prevs - seen)[:5],
+                    )
+
+            if prevs - seen:
+                logger.info(
+                    "Still missing %d events for room %r: %r...",
+                    len(prevs - seen), pdu.room_id, list(prevs - seen)[:5]
+                )
+                fetch_state = True
+
+        if fetch_state:
+            # We need to get the state at this event, since we haven't
+            # processed all the prev events.
+            logger.debug(
+                "_handle_new_pdu getting state for %s",
+                pdu.room_id
+            )
+            try:
+                state, auth_chain = yield self.replication_layer.get_state_for_room(
+                    origin, pdu.room_id, pdu.event_id,
+                )
+            except:
+                logger.exception("Failed to get state for event: %s", pdu.event_id)
+
+        yield self._process_received_pdu(
+            origin,
+            pdu,
+            state=state,
+            auth_chain=auth_chain,
+        )
+
+    @defer.inlineCallbacks
+    def _get_missing_events_for_pdu(self, origin, pdu, prevs, min_depth):
+        """
+        Args:
+            origin (str): Origin of the pdu. Will be called to get the missing events
+            pdu: received pdu
+            prevs (set(str)): List of event ids which we are missing
+            min_depth (int): Minimum depth of events to return.
+        """
+        # We recalculate seen, since it may have changed.
+        have_seen = yield self.store.have_events(prevs)
+        seen = set(have_seen.keys())
+
+        if not prevs - seen:
+            return
+
+        latest = yield self.store.get_latest_event_ids_in_room(
+            pdu.room_id
+        )
+
+        # We add the prev events that we have seen to the latest
+        # list to ensure the remote server doesn't give them to us
+        latest = set(latest)
+        latest |= seen
+
+        logger.info(
+            "Missing %d events for room %r pdu %s: %r...",
+            len(prevs - seen), pdu.room_id, pdu.event_id, list(prevs - seen)[:5]
+        )
+
+        # XXX: we set timeout to 10s to help workaround
+        # https://github.com/matrix-org/synapse/issues/1733.
+        # The reason is to avoid holding the linearizer lock
+        # whilst processing inbound /send transactions, causing
+        # FDs to stack up and block other inbound transactions
+        # which empirically can currently take up to 30 minutes.
+        #
+        # N.B. this explicitly disables retry attempts.
+        #
+        # N.B. this also increases our chances of falling back to
+        # fetching fresh state for the room if the missing event
+        # can't be found, which slightly reduces our security.
+        # it may also increase our DAG extremity count for the room,
+        # causing additional state resolution?  See #1760.
+        # However, fetching state doesn't hold the linearizer lock
+        # apparently.
+        #
+        # see https://github.com/matrix-org/synapse/pull/1744
+
+        missing_events = yield self.replication_layer.get_missing_events(
+            origin,
+            pdu.room_id,
+            earliest_events_ids=list(latest),
+            latest_events=[pdu],
+            limit=10,
+            min_depth=min_depth,
+            timeout=10000,
+        )
+
+        logger.info(
+            "Got %d events: %r...",
+            len(missing_events), [e.event_id for e in missing_events[:5]]
+        )
+
+        # We want to sort these by depth so we process them and
+        # tell clients about them in order.
+        missing_events.sort(key=lambda x: x.depth)
+
+        for e in missing_events:
+            logger.info("Handling found event %s", e.event_id)
+            yield self.on_receive_pdu(
+                origin,
+                e,
+                get_missing=False
+            )
+
+    @log_function
+    @defer.inlineCallbacks
+    def _process_received_pdu(self, origin, pdu, state, auth_chain):
+        """ Called when we have a new pdu. We need to do auth checks and put it
+        through the StateHandler.
+        """
+        event = pdu
+
+        logger.debug("Processing event: %s", event)
 
         # FIXME (erikj): Awful hack to make the case where we are not currently
         # in the room work
@@ -197,13 +380,6 @@ class FederationHandler(BaseHandler):
                     affected=event.event_id,
                 )
 
-        # if we're receiving valid events from an origin,
-        # it's probably a good idea to mark it as not in retry-state
-        # for sending (although this is a bit of a leap)
-        retry_timings = yield self.store.get_destination_retry_timings(origin)
-        if retry_timings and retry_timings["retry_last_ts"]:
-            self.store.set_destination_retry_timings(origin, 0, 0)
-
         room = yield self.store.get_room(event.room_id)
 
         if not room:
@@ -222,11 +398,10 @@ class FederationHandler(BaseHandler):
             target_user = UserID.from_string(target_user_id)
             extra_users.append(target_user)
 
-        with PreserveLoggingContext():
-            self.notifier.on_new_room_event(
-                event, event_stream_id, max_stream_id,
-                extra_users=extra_users
-            )
+        self.notifier.on_new_room_event(
+            event, event_stream_id, max_stream_id,
+            extra_users=extra_users
+        )
 
         if event.type == EventTypes.Member:
             if event.membership == Membership.JOIN:
@@ -268,9 +443,12 @@ class FederationHandler(BaseHandler):
             except:
                 return False
 
+        # Parses mapping `event_id -> (type, state_key) -> state event_id`
+        # to get all state ids that we're interested in.
         event_map = yield self.store.get_events([
-            e_id for key_to_eid in event_to_state_ids.values()
-            for key, e_id in key_to_eid
+            e_id
+            for key_to_eid in event_to_state_ids.values()
+            for key, e_id in key_to_eid.items()
             if key[0] != EventTypes.Member or check_match(key[1])
         ])
 
@@ -604,11 +782,12 @@ class FederationHandler(BaseHandler):
 
         event_ids = list(extremities.keys())
 
+        logger.debug("calling resolve_state_groups in _maybe_backfill")
         states = yield preserve_context_over_deferred(defer.gatherResults([
             preserve_fn(self.state_handler.resolve_state_groups)(room_id, [e])
             for e in event_ids
         ]))
-        states = dict(zip(event_ids, [s[1] for s in states]))
+        states = dict(zip(event_ids, [s.state for s in states]))
 
         state_map = yield self.store.get_events(
             [e_id for ids in states.values() for e_id in ids],
@@ -682,8 +861,6 @@ class FederationHandler(BaseHandler):
         """
         logger.debug("Joining %s to %s", joinee, room_id)
 
-        yield self.store.clean_room_for_join(room_id)
-
         origin, event = yield self._make_and_verify_event(
             target_hosts,
             room_id,
@@ -692,7 +869,15 @@ class FederationHandler(BaseHandler):
             content,
         )
 
+        # This shouldn't happen, because the RoomMemberHandler has a
+        # linearizer lock which only allows one operation per user per room
+        # at a time - so this is just paranoia.
+        assert (room_id not in self.room_queues)
+
         self.room_queues[room_id] = []
+
+        yield self.store.clean_room_for_join(room_id)
+
         handled_events = set()
 
         try:
@@ -734,27 +919,45 @@ class FederationHandler(BaseHandler):
                 origin, auth_chain, state, event
             )
 
-            with PreserveLoggingContext():
-                self.notifier.on_new_room_event(
-                    event, event_stream_id, max_stream_id,
-                    extra_users=[joinee]
-                )
+            self.notifier.on_new_room_event(
+                event, event_stream_id, max_stream_id,
+                extra_users=[joinee]
+            )
 
             logger.debug("Finished joining %s to %s", joinee, room_id)
         finally:
             room_queue = self.room_queues[room_id]
             del self.room_queues[room_id]
 
-            for p, origin in room_queue:
-                if p.event_id in handled_events:
-                    continue
+            # we don't need to wait for the queued events to be processed -
+            # it's just a best-effort thing at this point. We do want to do
+            # them roughly in order, though, otherwise we'll end up making
+            # lots of requests for missing prev_events which we do actually
+            # have. Hence we fire off the deferred, but don't wait for it.
 
-                try:
-                    self.on_receive_pdu(origin, p)
-                except:
-                    logger.exception("Couldn't handle pdu")
+            synapse.util.logcontext.preserve_fn(self._handle_queued_pdus)(
+                room_queue
+            )
 
         defer.returnValue(True)
+
+    @defer.inlineCallbacks
+    def _handle_queued_pdus(self, room_queue):
+        """Process PDUs which got queued up while we were busy send_joining.
+
+        Args:
+            room_queue (list[FrozenEvent, str]): list of PDUs to be processed
+                and the servers that sent them
+        """
+        for p, origin in room_queue:
+            try:
+                logger.info("Processing queued PDU %s which was received "
+                            "while we were joining %s", p.event_id, p.room_id)
+                yield self.on_receive_pdu(origin, p)
+            except Exception as e:
+                logger.warn(
+                    "Error handling queued PDU %s from %s: %s",
+                    p.event_id, origin, e)
 
     @defer.inlineCallbacks
     @log_function
@@ -803,6 +1006,20 @@ class FederationHandler(BaseHandler):
         )
 
         event.internal_metadata.outlier = False
+        # Send this event on behalf of the origin server.
+        #
+        # The reasons we have the destination server rather than the origin
+        # server send it are slightly mysterious: the origin server should have
+        # all the neccessary state once it gets the response to the send_join,
+        # so it could send the event itself if it wanted to. It may be that
+        # doing it this way reduces failure modes, or avoids certain attacks
+        # where a new server selectively tells a subset of the federation that
+        # it has joined.
+        #
+        # The fact is that, as of the current writing, Synapse doesn't send out
+        # the join event over federation after joining, and changing it now
+        # would introduce the danger of backwards-compatibility problems.
+        event.internal_metadata.send_on_behalf_of = origin
 
         context, event_stream_id, max_stream_id = yield self._handle_new_event(
             origin, event
@@ -820,34 +1037,14 @@ class FederationHandler(BaseHandler):
             target_user = UserID.from_string(target_user_id)
             extra_users.append(target_user)
 
-        with PreserveLoggingContext():
-            self.notifier.on_new_room_event(
-                event, event_stream_id, max_stream_id, extra_users=extra_users
-            )
+        self.notifier.on_new_room_event(
+            event, event_stream_id, max_stream_id, extra_users=extra_users
+        )
 
         if event.type == EventTypes.Member:
             if event.content["membership"] == Membership.JOIN:
                 user = UserID.from_string(event.state_key)
                 yield user_joined_room(self.distributor, user, event.room_id)
-
-        new_pdu = event
-
-        users_in_room = yield self.store.get_joined_users_from_context(event, context)
-
-        destinations = set(
-            get_domain_from_id(user_id) for user_id in users_in_room
-            if not self.hs.is_mine_id(user_id)
-        )
-
-        destinations.discard(origin)
-
-        logger.debug(
-            "on_send_join_request: Sending event: %s, signatures: %s",
-            event.event_id,
-            event.signatures,
-        )
-
-        self.replication_layer.send_pdu(new_pdu, destinations)
 
         state_ids = context.prev_state_ids.values()
         auth_chain = yield self.store.get_auth_chain(set(
@@ -888,48 +1085,35 @@ class FederationHandler(BaseHandler):
         )
 
         target_user = UserID.from_string(event.state_key)
-        with PreserveLoggingContext():
-            self.notifier.on_new_room_event(
-                event, event_stream_id, max_stream_id,
-                extra_users=[target_user],
-            )
+        self.notifier.on_new_room_event(
+            event, event_stream_id, max_stream_id,
+            extra_users=[target_user],
+        )
 
         defer.returnValue(event)
 
     @defer.inlineCallbacks
     def do_remotely_reject_invite(self, target_hosts, room_id, user_id):
-        try:
-            origin, event = yield self._make_and_verify_event(
-                target_hosts,
-                room_id,
-                user_id,
-                "leave"
-            )
-            signed_event = self._sign_event(event)
-        except SynapseError:
-            raise
-        except CodeMessageException as e:
-            logger.warn("Failed to reject invite: %s", e)
-            raise SynapseError(500, "Failed to reject invite")
+        origin, event = yield self._make_and_verify_event(
+            target_hosts,
+            room_id,
+            user_id,
+            "leave"
+        )
+        event = self._sign_event(event)
 
-        # Try the host we successfully got a response to /make_join/
-        # request first.
+        # Try the host that we succesfully called /make_leave/ on first for
+        # the /send_leave/ request.
         try:
             target_hosts.remove(origin)
             target_hosts.insert(0, origin)
         except ValueError:
             pass
 
-        try:
-            yield self.replication_layer.send_leave(
-                target_hosts,
-                signed_event
-            )
-        except SynapseError:
-            raise
-        except CodeMessageException as e:
-            logger.warn("Failed to reject invite: %s", e)
-            raise SynapseError(500, "Failed to reject invite")
+        yield self.replication_layer.send_leave(
+            target_hosts,
+            event
+        )
 
         context = yield self.state_handler.compute_event_context(event)
 
@@ -1050,28 +1234,9 @@ class FederationHandler(BaseHandler):
             target_user = UserID.from_string(target_user_id)
             extra_users.append(target_user)
 
-        with PreserveLoggingContext():
-            self.notifier.on_new_room_event(
-                event, event_stream_id, max_stream_id, extra_users=extra_users
-            )
-
-        new_pdu = event
-
-        users_in_room = yield self.store.get_joined_users_from_context(event, context)
-
-        destinations = set(
-            get_domain_from_id(user_id) for user_id in users_in_room
-            if not self.hs.is_mine_id(user_id)
+        self.notifier.on_new_room_event(
+            event, event_stream_id, max_stream_id, extra_users=extra_users
         )
-        destinations.discard(origin)
-
-        logger.debug(
-            "on_send_leave_request: Sending event: %s, signatures: %s",
-            event.event_id,
-            event.signatures,
-        )
-
-        self.replication_layer.send_pdu(new_pdu, destinations)
 
         defer.returnValue(None)
 
@@ -1141,7 +1306,7 @@ class FederationHandler(BaseHandler):
                     if prev_id != event.event_id:
                         results[(event.type, event.state_key)] = prev_id
                 else:
-                    del results[(event.type, event.state_key)]
+                    results.pop((event.type, event.state_key), None)
 
             defer.returnValue(results.values())
         else:
@@ -1364,14 +1529,23 @@ class FederationHandler(BaseHandler):
 
         event_stream_id, max_stream_id = yield self.store.persist_event(
             event, new_event_context,
-            current_state=state,
         )
 
         defer.returnValue((event_stream_id, max_stream_id))
 
     @defer.inlineCallbacks
     def _prep_event(self, origin, event, state=None, auth_events=None):
+        """
 
+        Args:
+            origin:
+            event:
+            state:
+            auth_events:
+
+        Returns:
+            Deferred, which resolves to synapse.events.snapshot.EventContext
+        """
         context = yield self.state_handler.compute_event_context(
             event, old_state=state,
         )
@@ -1575,7 +1749,7 @@ class FederationHandler(BaseHandler):
                     (d.type, d.state_key): d for d in different_events if d
                 })
 
-                new_state, prev_state = self.state_handler.resolve_events(
+                new_state = self.state_handler.resolve_events(
                     [local_view.values(), remote_view.values()],
                     event
                 )

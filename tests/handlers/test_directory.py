@@ -37,6 +37,7 @@ class DirectoryTestCase(unittest.TestCase):
     def setUp(self):
         self.mock_federation = Mock(spec=[
             "make_query",
+            "register_edu_handler",
         ])
 
         self.query_handlers = {}
@@ -92,6 +93,7 @@ class DirectoryTestCase(unittest.TestCase):
                 "room_alias": "#another:remote",
             },
             retry_on_dns_fail=False,
+            ignore_backoff=True,
         )
 
     @defer.inlineCallbacks

@@ -30,12 +30,28 @@ class ServerConfig(Config):
         self.use_frozen_dicts = config.get("use_frozen_dicts", False)
         self.public_baseurl = config.get("public_baseurl")
 
+        # Whether to send federation traffic out in this process. This only
+        # applies to some federation traffic, and so shouldn't be used to
+        # "disable" federation
+        self.send_federation = config.get("send_federation", True)
+
+        self.filter_timeline_limit = config.get("filter_timeline_limit", -1)
+
         if self.public_baseurl is not None:
             if self.public_baseurl[-1] != '/':
                 self.public_baseurl += '/'
         self.start_pushers = config.get("start_pushers", True)
 
         self.listeners = config.get("listeners", [])
+
+        for listener in self.listeners:
+            bind_address = listener.pop("bind_address", None)
+            bind_addresses = listener.setdefault("bind_addresses", [])
+
+            if bind_address:
+                bind_addresses.append(bind_address)
+            elif not bind_addresses:
+                bind_addresses.append('')
 
         self.gc_thresholds = read_gc_thresholds(config.get("gc_thresholds", None))
 
@@ -49,7 +65,7 @@ class ServerConfig(Config):
 
             self.listeners.append({
                 "port": bind_port,
-                "bind_address": bind_host,
+                "bind_addresses": [bind_host],
                 "tls": True,
                 "type": "http",
                 "resources": [
@@ -68,7 +84,7 @@ class ServerConfig(Config):
             if unsecure_port:
                 self.listeners.append({
                     "port": unsecure_port,
-                    "bind_address": bind_host,
+                    "bind_addresses": [bind_host],
                     "tls": False,
                     "type": "http",
                     "resources": [
@@ -87,7 +103,7 @@ class ServerConfig(Config):
         if manhole:
             self.listeners.append({
                 "port": manhole,
-                "bind_address": "127.0.0.1",
+                "bind_addresses": ["127.0.0.1"],
                 "type": "manhole",
             })
 
@@ -95,7 +111,7 @@ class ServerConfig(Config):
         if metrics_port:
             self.listeners.append({
                 "port": metrics_port,
-                "bind_address": config.get("metrics_bind_host", "127.0.0.1"),
+                "bind_addresses": [config.get("metrics_bind_host", "127.0.0.1")],
                 "tls": False,
                 "type": "http",
                 "resources": [
@@ -130,6 +146,12 @@ class ServerConfig(Config):
         # Whether to serve a web client from the HTTP/HTTPS root resource.
         web_client: True
 
+        # The root directory to server for the above web client.
+        # If left undefined, synapse will serve the matrix-angular-sdk web client.
+        # Make sure matrix-angular-sdk is installed with pip if web_client is True
+        # and web_client_location is undefined
+        # web_client_location: "/path/to/web/root"
+
         # The public-facing base URL for the client API (not including _matrix/...)
         # public_baseurl: https://example.com:8448/
 
@@ -141,6 +163,10 @@ class ServerConfig(Config):
         # The GC threshold parameters to pass to `gc.set_threshold`, if defined
         # gc_thresholds: [700, 10, 10]
 
+        # Set the limit on the returned events in the timeline in the get
+        # and sync operations. The default value is -1, means no upper limit.
+        # filter_timeline_limit: 5000
+
         # List of ports that Synapse should listen on, their purpose and their
         # configuration.
         listeners:
@@ -150,9 +176,14 @@ class ServerConfig(Config):
             # The port to listen for HTTPS requests on.
             port: %(bind_port)s
 
-            # Local interface to listen on.
-            # The empty string will cause synapse to listen on all interfaces.
-            bind_address: ''
+            # Local addresses to listen on.
+            # This will listen on all IPv4 addresses by default.
+            bind_addresses:
+              - '0.0.0.0'
+              # Uncomment to listen on all IPv6 interfaces
+              # N.B: On at least Linux this will also listen on all IPv4
+              # addresses, so you will need to comment out the line above.
+              # - '::'
 
             # This is a 'http' listener, allows us to specify 'resources'.
             type: http
@@ -183,7 +214,7 @@ class ServerConfig(Config):
           # For when matrix traffic passes through loadbalancer that unwraps TLS.
           - port: %(unsecure_port)s
             tls: false
-            bind_address: ''
+            bind_addresses: ['0.0.0.0']
             type: http
 
             x_forwarded: false

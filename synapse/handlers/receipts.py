@@ -33,8 +33,8 @@ class ReceiptsHandler(BaseHandler):
         self.server_name = hs.config.server_name
         self.store = hs.get_datastore()
         self.hs = hs
-        self.federation = hs.get_replication_layer()
-        self.federation.register_edu_handler(
+        self.federation = hs.get_federation_sender()
+        hs.get_replication_layer().register_edu_handler(
             "m.receipt", self._received_remote_receipt
         )
         self.clock = self.hs.get_clock()
@@ -100,7 +100,7 @@ class ReceiptsHandler(BaseHandler):
 
             if not res:
                 # res will be None if this read receipt is 'old'
-                defer.returnValue(False)
+                continue
 
             stream_id, max_persisted_id = res
 
@@ -108,6 +108,10 @@ class ReceiptsHandler(BaseHandler):
                 min_batch_id = stream_id
             if max_batch_id is None or max_persisted_id > max_batch_id:
                 max_batch_id = max_persisted_id
+
+        if min_batch_id is None:
+            # no new receipts
+            defer.returnValue(False)
 
         affected_room_ids = list(set([r["room_id"] for r in receipts]))
 
@@ -206,10 +210,9 @@ class ReceiptEventSource(object):
         else:
             from_key = None
 
-        rooms = yield self.store.get_rooms_for_user(user.to_string())
-        rooms = [room.room_id for room in rooms]
+        room_ids = yield self.store.get_rooms_for_user(user.to_string())
         events = yield self.store.get_linearized_receipts_for_rooms(
-            rooms,
+            room_ids,
             from_key=from_key,
             to_key=to_key,
         )

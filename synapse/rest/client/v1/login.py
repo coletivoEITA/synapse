@@ -19,6 +19,7 @@ from synapse.api.errors import SynapseError, LoginError, Codes
 from synapse.types import UserID
 from synapse.http.server import finish_request
 from synapse.http.servlet import parse_json_object_from_request
+from synapse.util.msisdn import phone_number_to_msisdn
 
 from .base import ClientV1RestServlet, client_path_patterns
 
@@ -33,8 +34,53 @@ from saml2.client import Saml2Client
 
 import xml.etree.ElementTree as ET
 
+from twisted.web.client import PartialDownloadError
+
 
 logger = logging.getLogger(__name__)
+
+
+def login_submission_legacy_convert(submission):
+    """
+    If the input login submission is an old style object
+    (ie. with top-level user / medium / address) convert it
+    to a typed object.
+    """
+    if "user" in submission:
+        submission["identifier"] = {
+            "type": "m.id.user",
+            "user": submission["user"],
+        }
+        del submission["user"]
+
+    if "medium" in submission and "address" in submission:
+        submission["identifier"] = {
+            "type": "m.id.thirdparty",
+            "medium": submission["medium"],
+            "address": submission["address"],
+        }
+        del submission["medium"]
+        del submission["address"]
+
+
+def login_id_thirdparty_from_phone(identifier):
+    """
+    Convert a phone login identifier type to a generic threepid identifier
+    Args:
+        identifier(dict): Login identifier dict of type 'm.id.phone'
+
+    Returns: Login identifier dict of type 'm.id.threepid'
+    """
+    if "country" not in identifier or "number" not in identifier:
+        raise SynapseError(400, "Invalid phone-type identifier")
+
+    msisdn = phone_number_to_msisdn(identifier["country"], identifier["number"])
+
+    return {
+        "type": "m.id.thirdparty",
+        "medium": "msisdn",
+        "address": msisdn,
+    }
 
 
 class LoginRestServlet(ClientV1RestServlet):
@@ -117,14 +163,52 @@ class LoginRestServlet(ClientV1RestServlet):
 
     @defer.inlineCallbacks
     def do_password_login(self, login_submission):
-        if 'medium' in login_submission and 'address' in login_submission:
+        if "password" not in login_submission:
+            raise SynapseError(400, "Missing parameter: password")
+
+        login_submission_legacy_convert(login_submission)
+
+        if "identifier" not in login_submission:
+            raise SynapseError(400, "Missing param: identifier")
+
+        identifier = login_submission["identifier"]
+        if "type" not in identifier:
+            raise SynapseError(400, "Login identifier has no type")
+
+        # convert phone type identifiers to generic threepids
+        if identifier["type"] == "m.id.phone":
+            identifier = login_id_thirdparty_from_phone(identifier)
+
+        # convert threepid identifiers to user IDs
+        if identifier["type"] == "m.id.thirdparty":
+            if 'medium' not in identifier or 'address' not in identifier:
+                raise SynapseError(400, "Invalid thirdparty identifier")
+
+            address = identifier['address']
+            if identifier['medium'] == 'email':
+                # For emails, transform the address to lowercase.
+                # We store all email addreses as lowercase in the DB.
+                # (See add_threepid in synapse/handlers/auth.py)
+                address = address.lower()
             user_id = yield self.hs.get_datastore().get_user_id_by_threepid(
-                login_submission['medium'], login_submission['address']
+                identifier['medium'], address
             )
             if not user_id:
                 raise LoginError(403, "", errcode=Codes.FORBIDDEN)
-        else:
-            user_id = login_submission['user']
+
+            identifier = {
+                "type": "m.id.user",
+                "user": user_id,
+            }
+
+        # by this point, the identifier should be an m.id.user: if it's anything
+        # else, we haven't understood it.
+        if identifier["type"] != "m.id.user":
+            raise SynapseError(400, "Unknown login identifier type")
+        if "user" not in identifier:
+            raise SynapseError(400, "User identifier is missing 'user' key")
+
+        user_id = identifier["user"]
 
         if not user_id.startswith('@'):
             user_id = UserID.create(
@@ -137,16 +221,13 @@ class LoginRestServlet(ClientV1RestServlet):
             password=login_submission["password"],
         )
         device_id = yield self._register_device(user_id, login_submission)
-        access_token, refresh_token = (
-            yield auth_handler.get_login_tuple_for_user_id(
-                user_id, device_id,
-                login_submission.get("initial_device_display_name")
-            )
+        access_token = yield auth_handler.get_access_token_for_user_id(
+            user_id, device_id,
+            login_submission.get("initial_device_display_name"),
         )
         result = {
             "user_id": user_id,  # may have changed
             "access_token": access_token,
-            "refresh_token": refresh_token,
             "home_server": self.hs.hostname,
             "device_id": device_id,
         }
@@ -161,16 +242,13 @@ class LoginRestServlet(ClientV1RestServlet):
             yield auth_handler.validate_short_term_login_token_and_get_user_id(token)
         )
         device_id = yield self._register_device(user_id, login_submission)
-        access_token, refresh_token = (
-            yield auth_handler.get_login_tuple_for_user_id(
-                user_id, device_id,
-                login_submission.get("initial_device_display_name")
-            )
+        access_token = yield auth_handler.get_access_token_for_user_id(
+            user_id, device_id,
+            login_submission.get("initial_device_display_name"),
         )
         result = {
             "user_id": user_id,  # may have changed
             "access_token": access_token,
-            "refresh_token": refresh_token,
             "home_server": self.hs.hostname,
             "device_id": device_id,
         }
@@ -207,16 +285,14 @@ class LoginRestServlet(ClientV1RestServlet):
             device_id = yield self._register_device(
                 registered_user_id, login_submission
             )
-            access_token, refresh_token = (
-                yield auth_handler.get_login_tuple_for_user_id(
-                    registered_user_id, device_id,
-                    login_submission.get("initial_device_display_name")
-                )
+            access_token = yield auth_handler.get_access_token_for_user_id(
+                registered_user_id, device_id,
+                login_submission.get("initial_device_display_name"),
             )
+
             result = {
                 "user_id": registered_user_id,
                 "access_token": access_token,
-                "refresh_token": refresh_token,
                 "home_server": self.hs.hostname,
             }
         else:
@@ -332,6 +408,7 @@ class CasTicketServlet(ClientV1RestServlet):
         self.cas_required_attributes = hs.config.cas_required_attributes
         self.auth_handler = hs.get_auth_handler()
         self.handlers = hs.get_handlers()
+        self.macaroon_gen = hs.get_macaroon_generator()
 
     @defer.inlineCallbacks
     def on_GET(self, request):
@@ -342,7 +419,12 @@ class CasTicketServlet(ClientV1RestServlet):
             "ticket": request.args["ticket"],
             "service": self.cas_service_url
         }
-        body = yield http_client.get_raw(uri, args)
+        try:
+            body = yield http_client.get_raw(uri, args)
+        except PartialDownloadError as pde:
+            # Twisted raises this error if the connection is closed,
+            # even if that's being used old-http style to signal end-of-data
+            body = pde.response
         result = yield self.handle_cas_response(request, body, client_redirect_url)
         defer.returnValue(result)
 
@@ -370,7 +452,9 @@ class CasTicketServlet(ClientV1RestServlet):
                 yield self.handlers.registration_handler.register(localpart=user)
             )
 
-        login_token = auth_handler.generate_short_term_login_token(registered_user_id)
+        login_token = self.macaroon_gen.generate_short_term_login_token(
+            registered_user_id
+        )
         redirect_url = self.add_login_token_to_redirect_url(client_redirect_url,
                                                             login_token)
         request.redirect(redirect_url)

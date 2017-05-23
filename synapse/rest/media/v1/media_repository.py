@@ -13,26 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from twisted.internet import defer, threads
+import twisted.internet.error
+import twisted.web.http
+from twisted.web.resource import Resource
+
 from .upload_resource import UploadResource
 from .download_resource import DownloadResource
 from .thumbnail_resource import ThumbnailResource
 from .identicon_resource import IdenticonResource
 from .preview_url_resource import PreviewUrlResource
 from .filepath import MediaFilePaths
-
-from twisted.web.resource import Resource
-
 from .thumbnailer import Thumbnailer
 
 from synapse.http.matrixfederationclient import MatrixFederationHttpClient
 from synapse.util.stringutils import random_string
-from synapse.api.errors import SynapseError
-
-from twisted.internet import defer, threads
+from synapse.api.errors import SynapseError, HttpResponseException, \
+    NotFoundError
 
 from synapse.util.async import Linearizer
 from synapse.util.stringutils import is_ascii
 from synapse.util.logcontext import preserve_context_over_fn
+from synapse.util.retryutils import NotRetryingDestination
 
 import os
 import errno
@@ -61,7 +63,7 @@ class MediaRepository(object):
         self.dynamic_thumbnails = hs.config.dynamic_thumbnails
         self.thumbnail_requirements = hs.config.thumbnail_requirements
 
-        self.remote_media_linearizer = Linearizer()
+        self.remote_media_linearizer = Linearizer(name="media_remote")
 
         self.recently_accessed_remotes = set()
 
@@ -97,6 +99,8 @@ class MediaRepository(object):
         # already been uploaded at this point.
         with open(fname, "wb") as f:
             f.write(content)
+
+        logger.info("Stored local media in file %r", fname)
 
         yield self.store.store_local_media(
             media_id=media_id,
@@ -155,11 +159,35 @@ class MediaRepository(object):
                 try:
                     length, headers = yield self.client.get_file(
                         server_name, request_path, output_stream=f,
-                        max_size=self.max_upload_size,
+                        max_size=self.max_upload_size, args={
+                            # tell the remote server to 404 if it doesn't
+                            # recognise the server_name, to make sure we don't
+                            # end up with a routing loop.
+                            "allow_remote": "false",
+                        }
                     )
-                except Exception as e:
-                    logger.warn("Failed to fetch remoted media %r", e)
-                    raise SynapseError(502, "Failed to fetch remoted media")
+                except twisted.internet.error.DNSLookupError as e:
+                    logger.warn("HTTP error fetching remote media %s/%s: %r",
+                                server_name, media_id, e)
+                    raise NotFoundError()
+
+                except HttpResponseException as e:
+                    logger.warn("HTTP error fetching remote media %s/%s: %s",
+                                server_name, media_id, e.response)
+                    if e.code == twisted.web.http.NOT_FOUND:
+                        raise SynapseError.from_http_response_exception(e)
+                    raise SynapseError(502, "Failed to fetch remote media")
+
+                except SynapseError:
+                    logger.exception("Failed to fetch remote media %s/%s",
+                                     server_name, media_id)
+                    raise
+                except NotRetryingDestination:
+                    logger.warn("Not retrying destination %r", server_name)
+                except Exception:
+                    logger.exception("Failed to fetch remote media %s/%s",
+                                     server_name, media_id)
+                    raise SynapseError(502, "Failed to fetch remote media")
 
             media_type = headers["Content-Type"][0]
             time_now_ms = self.clock.time_msec()
@@ -189,6 +217,8 @@ class MediaRepository(object):
                         upload_name = None
             else:
                 upload_name = None
+
+            logger.info("Stored remote media in file %r", fname)
 
             yield self.store.store_cached_remote_media(
                 origin=server_name,
@@ -236,6 +266,9 @@ class MediaRepository(object):
         if t_method == "crop":
             t_len = thumbnailer.crop(t_path, t_width, t_height, t_type)
         elif t_method == "scale":
+            t_width, t_height = thumbnailer.aspect(t_width, t_height)
+            t_width = min(m_width, t_width)
+            t_height = min(m_height, t_height)
             t_len = thumbnailer.scale(t_path, t_width, t_height, t_type)
         else:
             t_len = None

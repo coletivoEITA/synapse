@@ -20,7 +20,7 @@ The overall architecture is::
              https://somewhere.org/_matrix      https://elsewhere.net/_matrix
 
 ``#matrix:matrix.org`` is the official support room for Matrix, and can be
-accessed by any client from https://matrix.org/docs/projects/try-matrix-now or
+accessed by any client from https://matrix.org/docs/projects/try-matrix-now.html or
 via IRC bridge at irc://irc.freenode.net/matrix.
 
 Synapse is currently in rapid development, but as of version 0.5 we believe it
@@ -68,7 +68,7 @@ or mandatory service provider in Matrix, unlike WhatsApp, Facebook, Hangouts,
 etc.
 
 We'd like to invite you to join #matrix:matrix.org (via
-https://matrix.org/docs/projects/try-matrix-now), run a homeserver, take a look
+https://matrix.org/docs/projects/try-matrix-now.html), run a homeserver, take a look
 at the `Matrix spec <https://matrix.org/docs/spec>`_, and experiment with the
 `APIs <https://matrix.org/docs/api>`_ and `Client SDKs
 <http://matrix.org/docs/projects/try-matrix-now.html#client-sdks>`_.
@@ -84,11 +84,17 @@ Synapse Installation
 Synapse is the reference python/twisted Matrix homeserver implementation.
 
 System requirements:
+
 - POSIX-compliant system (tested on Linux & OS X)
 - Python 2.7
 - At least 1GB of free RAM if you want to join large public rooms like #matrix:matrix.org
 
-Synapse is written in python but some of the libraries is uses are written in
+Installing from source
+----------------------
+(Prebuilt packages are available for some platforms - see `Platform-Specific
+Instructions`_.)
+
+Synapse is written in python but some of the libraries it uses are written in
 C. So before we can install synapse itself we need a working C compiler and the
 header files for python C extensions.
 
@@ -103,10 +109,10 @@ Installing prerequisites on ArchLinux::
     sudo pacman -S base-devel python2 python-pip \
                    python-setuptools python-virtualenv sqlite3
 
-Installing prerequisites on CentOS 7::
+Installing prerequisites on CentOS 7 or Fedora 25::
 
     sudo yum install libtiff-devel libjpeg-devel libzip-devel freetype-devel \
-                     lcms2-devel libwebp-devel tcl-devel tk-devel \
+                     lcms2-devel libwebp-devel tcl-devel tk-devel redhat-rpm-config \
                      python-virtualenv libffi-devel openssl-devel
     sudo yum groupinstall "Development Tools"
 
@@ -115,6 +121,7 @@ Installing prerequisites on Mac OS X::
     xcode-select --install
     sudo easy_install pip
     sudo pip install virtualenv
+    brew install pkg-config libffi
 
 Installing prerequisites on Raspbian::
 
@@ -131,10 +138,16 @@ Installing prerequisites on openSUSE::
     sudo zypper in python-pip python-setuptools sqlite3 python-virtualenv \
                    python-devel libffi-devel libopenssl-devel libjpeg62-devel
 
+Installing prerequisites on OpenBSD::
+
+    doas pkg_add python libffi py-pip py-setuptools sqlite3 py-virtualenv \
+                 libxslt
+
 To install the synapse homeserver run::
 
     virtualenv -p python2.7 ~/.synapse
     source ~/.synapse/bin/activate
+    pip install --upgrade pip
     pip install --upgrade setuptools
     pip install https://github.com/matrix-org/synapse/tarball/master
 
@@ -217,6 +230,7 @@ To get started, it is easiest to use the command line to register new users::
     New user localpart: erikj
     Password:
     Confirm password:
+    Make admin [no]:
     Success!
 
 This process uses a setting ``registration_shared_secret`` in
@@ -231,6 +245,25 @@ Setting up a TURN server
 
 For reliable VoIP calls to be routed via this homeserver, you MUST configure
 a TURN server.  See `<docs/turn-howto.rst>`_ for details.
+
+IPv6
+----
+
+As of Synapse 0.19 we finally support IPv6, many thanks to @kyrias and @glyph
+for providing PR #1696.
+
+However, for federation to work on hosts with IPv6 DNS servers you **must**
+be running Twisted 17.1.0 or later - see https://github.com/matrix-org/synapse/issues/1002
+for details.  We can't make Synapse depend on Twisted 17.1 by default
+yet as it will break most older distributions (see https://github.com/matrix-org/synapse/pull/1909)
+so if you are using operating system dependencies you'll have to install your
+own Twisted 17.1 package via pip or backports etc.
+
+If you're running in a virtualenv then pip should have installed the newest
+Twisted automatically, but if your virtualenv is old you will need to manually
+upgrade to a newer Twisted dependency via:
+
+    pip install Twisted>=17.1.0
 
 
 Running Synapse
@@ -302,7 +335,7 @@ See https://github.com/vector-im/vector-web/issues/1977 and
 https://developer.github.com/changes/2014-04-25-user-content-security for more details.
 
 
-Platform Specific Instructions
+Platform-Specific Instructions
 ==============================
 
 Debian
@@ -310,7 +343,7 @@ Debian
 
 Matrix provides official Debian packages via apt from http://matrix.org/packages/debian/.
 Note that these packages do not include a client - choose one from
-https://matrix.org/docs/projects/try-matrix-now/ (or build your own with one of our SDKs :)
+https://matrix.org/docs/projects/try-matrix-now.html (or build your own with one of our SDKs :)
 
 Fedora
 ------
@@ -321,10 +354,12 @@ https://obs.infoserver.lv/project/monitor/matrix-synapse
 ArchLinux
 ---------
 
-The quickest way to get up and running with ArchLinux is probably with Ivan
-Shapovalov's AUR package from
-https://aur.archlinux.org/packages/matrix-synapse/, which should pull in all
-the necessary dependencies.
+The quickest way to get up and running with ArchLinux is probably with the community package
+https://www.archlinux.org/packages/community/any/matrix-synapse/, which should pull in most of
+the necessary dependencies. If the default web client is to be served (enabled by default in
+the generated config),
+https://www.archlinux.org/packages/community/any/python2-matrix-angular-sdk/ will also need to
+be installed. 
 
 Alternatively, to install using pip a few changes may be needed as ArchLinux
 defaults to python 3, but synapse currently assumes python 2.7 by default:
@@ -361,8 +396,34 @@ FreeBSD
 
 Synapse can be installed via FreeBSD Ports or Packages contributed by Brendan Molloy from:
 
- - Ports: ``cd /usr/ports/net/py-matrix-synapse && make install clean``
+ - Ports: ``cd /usr/ports/net-im/py-matrix-synapse && make install clean``
  - Packages: ``pkg install py27-matrix-synapse``
+
+
+OpenBSD
+-------
+
+There is currently no port for OpenBSD. Additionally, OpenBSD's security
+settings require a slightly more difficult installation process.
+
+1) Create a new directory in ``/usr/local`` called ``_synapse``. Also, create a
+   new user called ``_synapse`` and set that directory as the new user's home.
+   This is required because, by default, OpenBSD only allows binaries which need
+   write and execute permissions on the same memory space to be run from
+   ``/usr/local``.
+2) ``su`` to the new ``_synapse`` user and change to their home directory.
+3) Create a new virtualenv: ``virtualenv -p python2.7 ~/.synapse``
+4) Source the virtualenv configuration located at
+   ``/usr/local/_synapse/.synapse/bin/activate``. This is done in ``ksh`` by
+   using the ``.`` command, rather than ``bash``'s ``source``.
+5) Optionally, use ``pip`` to install ``lxml``, which Synapse needs to parse
+   webpages for their titles.
+6) Use ``pip`` to install this repository: ``pip install
+   https://github.com/matrix-org/synapse/tarball/master``
+7) Optionally, change ``_synapse``'s shell to ``/bin/false`` to reduce the
+   chance of a compromised Synapse server being used to take over your box.
+
+After this, you may proceed with the rest of the install directions.
 
 NixOS
 -----
@@ -622,7 +683,7 @@ configuration might look like::
       }
   }
 
-You will also want to set ``bind_address: 127.0.0.1`` and ``x_forwarded: true``
+You will also want to set ``bind_addresses: ['127.0.0.1']`` and ``x_forwarded: true``
 for port 8008 in ``homeserver.yaml`` to ensure that client IP addresses are
 recorded correctly.
 
@@ -759,6 +820,10 @@ Then update the `users` table in the database::
 Synapse Development
 ===================
 
+Before setting up a development environment for synapse, make sure you have the
+system dependencies (such as the python header files) installed - see
+`Installing from source`_.
+
 To check out a synapse for development, clone the git repo into a working
 directory of your choice::
 
@@ -768,10 +833,10 @@ directory of your choice::
 Synapse has a number of external dependencies, that are easiest
 to install using pip and a virtualenv::
 
-    virtualenv env
+    virtualenv -p python2.7 env
     source env/bin/activate
-    python synapse/python_dependencies.py | xargs -n1 pip install
-    pip install setuptools_trial mock
+    python synapse/python_dependencies.py | xargs pip install
+    pip install lxml mock
 
 This will run a process of downloading and installing all the needed
 dependencies into a virtual env.
@@ -779,7 +844,7 @@ dependencies into a virtual env.
 Once this is done, you may wish to run Synapse's unit tests, to
 check that everything is installed as it should be::
 
-    python setup.py test
+    PYTHONPATH="." trial tests
 
 This should end with a 'PASSED' result::
 

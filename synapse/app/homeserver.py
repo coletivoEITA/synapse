@@ -20,10 +20,12 @@ import gc
 import logging
 import os
 import sys
+
+import synapse.config.logger
 from synapse.config._base import ConfigError
 
 from synapse.python_dependencies import (
-    check_requirements, DEPENDENCY_LINKS
+    check_requirements, CONDITIONAL_REQUIREMENTS
 )
 
 from synapse.rest import ClientRestResource
@@ -50,10 +52,10 @@ from synapse.api.urls import (
 )
 from synapse.config.homeserver import HomeServerConfig
 from synapse.crypto import context_factory
-from synapse.util.logcontext import LoggingContext
+from synapse.util.logcontext import LoggingContext, PreserveLoggingContext
 from synapse.metrics import register_memory_metrics, get_metrics_for
 from synapse.metrics.resource import MetricsResource, METRICS_PREFIX
-from synapse.replication.resource import ReplicationResource, REPLICATION_PREFIX
+from synapse.replication.tcp.resource import ReplicationStreamProtocolFactory
 from synapse.federation.transport.server import TransportLayerServer
 
 from synapse.util.rlimit import change_resource_limit
@@ -90,7 +92,7 @@ def build_resource_for_web_client(hs):
                 "\n"
                 "You can also disable hosting of the webclient via the\n"
                 "configuration option `web_client`\n"
-                % {"dep": DEPENDENCY_LINKS["matrix-angular-sdk"]}
+                % {"dep": CONDITIONAL_REQUIREMENTS["web_client"].keys()[0]}
             )
         syweb_path = os.path.dirname(syweb.__file__)
         webclient_path = os.path.join(syweb_path, "webclient")
@@ -107,7 +109,7 @@ def build_resource_for_web_client(hs):
 class SynapseHomeServer(HomeServer):
     def _listener_http(self, config, listener_config):
         port = listener_config["port"]
-        bind_address = listener_config.get("bind_address", "")
+        bind_addresses = listener_config["bind_addresses"]
         tls = listener_config.get("tls", False)
         site_tag = listener_config.get("tag", port)
 
@@ -164,38 +166,38 @@ class SynapseHomeServer(HomeServer):
                 if name == "metrics" and self.get_config().enable_metrics:
                     resources[METRICS_PREFIX] = MetricsResource(self)
 
-                if name == "replication":
-                    resources[REPLICATION_PREFIX] = ReplicationResource(self)
-
         if WEB_CLIENT_PREFIX in resources:
             root_resource = RootRedirect(WEB_CLIENT_PREFIX)
         else:
             root_resource = Resource()
 
         root_resource = create_resource_tree(resources, root_resource)
+
         if tls:
-            reactor.listenSSL(
-                port,
-                SynapseSite(
-                    "synapse.access.https.%s" % (site_tag,),
-                    site_tag,
-                    listener_config,
-                    root_resource,
-                ),
-                self.tls_server_context_factory,
-                interface=bind_address
-            )
+            for address in bind_addresses:
+                reactor.listenSSL(
+                    port,
+                    SynapseSite(
+                        "synapse.access.https.%s" % (site_tag,),
+                        site_tag,
+                        listener_config,
+                        root_resource,
+                    ),
+                    self.tls_server_context_factory,
+                    interface=address
+                )
         else:
-            reactor.listenTCP(
-                port,
-                SynapseSite(
-                    "synapse.access.http.%s" % (site_tag,),
-                    site_tag,
-                    listener_config,
-                    root_resource,
-                ),
-                interface=bind_address
-            )
+            for address in bind_addresses:
+                reactor.listenTCP(
+                    port,
+                    SynapseSite(
+                        "synapse.access.http.%s" % (site_tag,),
+                        site_tag,
+                        listener_config,
+                        root_resource,
+                    ),
+                    interface=address
+                )
         logger.info("Synapse now listening on port %d", port)
 
     def start_listening(self):
@@ -205,15 +207,28 @@ class SynapseHomeServer(HomeServer):
             if listener["type"] == "http":
                 self._listener_http(config, listener)
             elif listener["type"] == "manhole":
-                reactor.listenTCP(
-                    listener["port"],
-                    manhole(
-                        username="matrix",
-                        password="rabbithole",
-                        globals={"hs": self},
-                    ),
-                    interface=listener.get("bind_address", '127.0.0.1')
-                )
+                bind_addresses = listener["bind_addresses"]
+
+                for address in bind_addresses:
+                    reactor.listenTCP(
+                        listener["port"],
+                        manhole(
+                            username="matrix",
+                            password="rabbithole",
+                            globals={"hs": self},
+                        ),
+                        interface=address
+                    )
+            elif listener["type"] == "replication":
+                bind_addresses = listener["bind_addresses"]
+                for address in bind_addresses:
+                    factory = ReplicationStreamProtocolFactory(self)
+                    server_listener = reactor.listenTCP(
+                        listener["port"], factory, interface=address
+                    )
+                    reactor.addSystemEventTrigger(
+                        "before", "shutdown", server_listener.stopListening,
+                    )
             else:
                 logger.warn("Unrecognized listener type: %s", listener["type"])
 
@@ -280,7 +295,7 @@ def setup(config_options):
         # generating config files and shouldn't try to continue.
         sys.exit(0)
 
-    config.setup_logging()
+    synapse.config.logger.setup_logging(config, use_worker_options=False)
 
     # check any extra requirements we have now we have a config
     check_requirements(config)
@@ -448,7 +463,12 @@ def run(hs):
     def in_thread():
         # Uncomment to enable tracing of log context changes.
         # sys.settrace(logcontext_tracer)
-        with LoggingContext("run"):
+
+        # make sure that we run the reactor with the sentinel log context,
+        # otherwise other PreserveLoggingContext instances will get confused
+        # and complain when they see the logcontext arbitrarily swapping
+        # between the sentinel and `run` logcontexts.
+        with PreserveLoggingContext():
             change_resource_limit(hs.config.soft_file_limit)
             if hs.config.gc_thresholds:
                 gc.set_threshold(*hs.config.gc_thresholds)

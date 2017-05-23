@@ -21,6 +21,8 @@ from synapse.api.errors import SynapseError
 from synapse.http.servlet import (
     RestServlet, parse_json_object_from_request, parse_integer
 )
+from synapse.http.servlet import parse_string
+from synapse.types import StreamToken
 from ._base import client_v2_patterns
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,7 @@ class KeyUploadServlet(RestServlet):
 
     @defer.inlineCallbacks
     def on_POST(self, request, device_id):
-        requester = yield self.auth.get_user_by_req(request)
+        requester = yield self.auth.get_user_by_req(request, allow_guest=True)
         user_id = requester.user.to_string()
         body = parse_json_object_from_request(request)
 
@@ -94,10 +96,6 @@ class KeyUploadServlet(RestServlet):
 
 class KeyQueryServlet(RestServlet):
     """
-    GET /keys/query/<user_id> HTTP/1.1
-
-    GET /keys/query/<user_id>/<device_id> HTTP/1.1
-
     POST /keys/query HTTP/1.1
     Content-Type: application/json
     {
@@ -131,11 +129,7 @@ class KeyQueryServlet(RestServlet):
     """
 
     PATTERNS = client_v2_patterns(
-        "/keys/query(?:"
-        "/(?P<user_id>[^/]*)(?:"
-        "/(?P<device_id>[^/]*)"
-        ")?"
-        ")?",
+        "/keys/query$",
         releases=()
     )
 
@@ -149,31 +143,62 @@ class KeyQueryServlet(RestServlet):
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
 
     @defer.inlineCallbacks
-    def on_POST(self, request, user_id, device_id):
-        yield self.auth.get_user_by_req(request)
+    def on_POST(self, request):
+        yield self.auth.get_user_by_req(request, allow_guest=True)
         timeout = parse_integer(request, "timeout", 10 * 1000)
         body = parse_json_object_from_request(request)
         result = yield self.e2e_keys_handler.query_devices(body, timeout)
         defer.returnValue((200, result))
 
+
+class KeyChangesServlet(RestServlet):
+    """Returns the list of changes of keys between two stream tokens (may return
+    spurious extra results, since we currently ignore the `to` param).
+
+        GET /keys/changes?from=...&to=...
+
+        200 OK
+        { "changed": ["@foo:example.com"] }
+    """
+    PATTERNS = client_v2_patterns(
+        "/keys/changes$",
+        releases=()
+    )
+
+    def __init__(self, hs):
+        """
+        Args:
+            hs (synapse.server.HomeServer):
+        """
+        super(KeyChangesServlet, self).__init__()
+        self.auth = hs.get_auth()
+        self.device_handler = hs.get_device_handler()
+
     @defer.inlineCallbacks
-    def on_GET(self, request, user_id, device_id):
-        requester = yield self.auth.get_user_by_req(request)
-        timeout = parse_integer(request, "timeout", 10 * 1000)
-        auth_user_id = requester.user.to_string()
-        user_id = user_id if user_id else auth_user_id
-        device_ids = [device_id] if device_id else []
-        result = yield self.e2e_keys_handler.query_devices(
-            {"device_keys": {user_id: device_ids}},
-            timeout,
+    def on_GET(self, request):
+        requester = yield self.auth.get_user_by_req(request, allow_guest=True)
+
+        from_token_string = parse_string(request, "from")
+
+        # We want to enforce they do pass us one, but we ignore it and return
+        # changes after the "to" as well as before.
+        parse_string(request, "to")
+
+        from_token = StreamToken.from_string(from_token_string)
+
+        user_id = requester.user.to_string()
+
+        changed = yield self.device_handler.get_user_ids_changed(
+            user_id, from_token,
         )
-        defer.returnValue((200, result))
+
+        defer.returnValue((200, {
+            "changed": list(changed),
+        }))
 
 
 class OneTimeKeyServlet(RestServlet):
     """
-    GET /keys/claim/<user-id>/<device-id>/<algorithm> HTTP/1.1
-
     POST /keys/claim HTTP/1.1
     {
       "one_time_keys": {
@@ -191,9 +216,7 @@ class OneTimeKeyServlet(RestServlet):
 
     """
     PATTERNS = client_v2_patterns(
-        "/keys/claim(?:/?|(?:/"
-        "(?P<user_id>[^/]*)/(?P<device_id>[^/]*)/(?P<algorithm>[^/]*)"
-        ")?)",
+        "/keys/claim$",
         releases=()
     )
 
@@ -203,18 +226,8 @@ class OneTimeKeyServlet(RestServlet):
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
 
     @defer.inlineCallbacks
-    def on_GET(self, request, user_id, device_id, algorithm):
-        yield self.auth.get_user_by_req(request)
-        timeout = parse_integer(request, "timeout", 10 * 1000)
-        result = yield self.e2e_keys_handler.claim_one_time_keys(
-            {"one_time_keys": {user_id: {device_id: algorithm}}},
-            timeout,
-        )
-        defer.returnValue((200, result))
-
-    @defer.inlineCallbacks
-    def on_POST(self, request, user_id, device_id, algorithm):
-        yield self.auth.get_user_by_req(request)
+    def on_POST(self, request):
+        yield self.auth.get_user_by_req(request, allow_guest=True)
         timeout = parse_integer(request, "timeout", 10 * 1000)
         body = parse_json_object_from_request(request)
         result = yield self.e2e_keys_handler.claim_one_time_keys(
@@ -227,4 +240,5 @@ class OneTimeKeyServlet(RestServlet):
 def register_servlets(hs, http_server):
     KeyUploadServlet(hs).register(http_server)
     KeyQueryServlet(hs).register(http_server)
+    KeyChangesServlet(hs).register(http_server)
     OneTimeKeyServlet(hs).register(http_server)

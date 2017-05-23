@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright 2014 - 2016 OpenMarket Ltd
+# Copyright 2017 Vector Creations Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,6 +48,7 @@ class AuthHandler(BaseHandler):
             LoginType.PASSWORD: self._check_password_auth,
             LoginType.RECAPTCHA: self._check_recaptcha,
             LoginType.EMAIL_IDENTITY: self._check_email_identity,
+            LoginType.MSISDN: self._check_msisdn,
             LoginType.DUMMY: self._check_dummy_auth,
         }
         self.bcrypt_rounds = hs.config.bcrypt_rounds
@@ -61,8 +63,11 @@ class AuthHandler(BaseHandler):
             for module, config in hs.config.password_providers
         ]
 
+        logger.info("Extra password_providers: %r", self.password_providers)
+
         self.hs = hs  # FIXME better possibility to access registrationHandler later?
         self.device_handler = hs.get_device_handler()
+        self.macaroon_gen = hs.get_macaroon_generator()
 
     @defer.inlineCallbacks
     def check_auth(self, flows, clientdict, clientip):
@@ -160,7 +165,15 @@ class AuthHandler(BaseHandler):
 
         for f in flows:
             if len(set(f) - set(creds.keys())) == 0:
-                logger.info("Auth completed with creds: %r", creds)
+                # it's very useful to know what args are stored, but this can
+                # include the password in the case of registering, so only log
+                # the keys (confusingly, clientdict may contain a password
+                # param, creds is just what the user authed as for UI auth
+                # and is not sensitive).
+                logger.info(
+                    "Auth completed with creds: %r. Client dict has keys: %r",
+                    creds, clientdict.keys()
+                )
                 defer.returnValue((True, creds, clientdict, session['id']))
 
         ret = self._auth_dict_for_flows(flows, session)
@@ -296,30 +309,46 @@ class AuthHandler(BaseHandler):
                 defer.returnValue(True)
         raise LoginError(401, "", errcode=Codes.UNAUTHORIZED)
 
-    @defer.inlineCallbacks
     def _check_email_identity(self, authdict, _):
+        return self._check_threepid('email', authdict)
+
+    def _check_msisdn(self, authdict, _):
+        return self._check_threepid('msisdn', authdict)
+
+    @defer.inlineCallbacks
+    def _check_dummy_auth(self, authdict, _):
+        yield run_on_reactor()
+        defer.returnValue(True)
+
+    @defer.inlineCallbacks
+    def _check_threepid(self, medium, authdict):
         yield run_on_reactor()
 
         if 'threepid_creds' not in authdict:
             raise LoginError(400, "Missing threepid_creds", Codes.MISSING_PARAM)
 
         threepid_creds = authdict['threepid_creds']
+
         identity_handler = self.hs.get_handlers().identity_handler
 
-        logger.info("Getting validated threepid. threepidcreds: %r" % (threepid_creds,))
+        logger.info("Getting validated threepid. threepidcreds: %r", (threepid_creds,))
         threepid = yield identity_handler.threepid_from_creds(threepid_creds)
 
         if not threepid:
             raise LoginError(401, "", errcode=Codes.UNAUTHORIZED)
 
+        if threepid['medium'] != medium:
+            raise LoginError(
+                401,
+                "Expecting threepid of type '%s', got '%s'" % (
+                    medium, threepid['medium'],
+                ),
+                errcode=Codes.UNAUTHORIZED
+            )
+
         threepid['threepid_creds'] = authdict['threepid_creds']
 
         defer.returnValue(threepid)
-
-    @defer.inlineCallbacks
-    def _check_dummy_auth(self, authdict, _):
-        yield run_on_reactor()
-        defer.returnValue(True)
 
     def _get_params_recaptcha(self):
         return {"public_key": self.hs.config.recaptcha_public_key}
@@ -378,12 +407,10 @@ class AuthHandler(BaseHandler):
         return self._check_password(user_id, password)
 
     @defer.inlineCallbacks
-    def get_login_tuple_for_user_id(self, user_id, device_id=None,
-                                    initial_display_name=None):
+    def get_access_token_for_user_id(self, user_id, device_id=None,
+                                     initial_display_name=None):
         """
-        Gets login tuple for the user with the given user ID.
-
-        Creates a new access/refresh token for the user.
+        Creates a new access token for the user with the given user ID.
 
         The user is assumed to have been authenticated by some other
         machanism (e.g. CAS), and the user_id converted to the canonical case.
@@ -398,16 +425,13 @@ class AuthHandler(BaseHandler):
             initial_display_name (str): display name to associate with the
                device if it needs re-registering
         Returns:
-            A tuple of:
               The access token for the user's session.
-              The refresh token for the user's session.
         Raises:
             StoreError if there was a problem storing the token.
             LoginError if there was an authentication problem.
         """
         logger.info("Logging in user %s on device %s", user_id, device_id)
         access_token = yield self.issue_access_token(user_id, device_id)
-        refresh_token = yield self.issue_refresh_token(user_id, device_id)
 
         # the device *should* have been registered before we got here; however,
         # it's possible we raced against a DELETE operation. The thing we
@@ -418,7 +442,7 @@ class AuthHandler(BaseHandler):
                 user_id, device_id, initial_display_name
             )
 
-        defer.returnValue((access_token, refresh_token))
+        defer.returnValue(access_token)
 
     @defer.inlineCallbacks
     def check_user_exists(self, user_id):
@@ -524,52 +548,10 @@ class AuthHandler(BaseHandler):
 
     @defer.inlineCallbacks
     def issue_access_token(self, user_id, device_id=None):
-        access_token = self.generate_access_token(user_id)
+        access_token = self.macaroon_gen.generate_access_token(user_id)
         yield self.store.add_access_token_to_user(user_id, access_token,
                                                   device_id)
         defer.returnValue(access_token)
-
-    @defer.inlineCallbacks
-    def issue_refresh_token(self, user_id, device_id=None):
-        refresh_token = self.generate_refresh_token(user_id)
-        yield self.store.add_refresh_token_to_user(user_id, refresh_token,
-                                                   device_id)
-        defer.returnValue(refresh_token)
-
-    def generate_access_token(self, user_id, extra_caveats=None,
-                              duration_in_ms=(60 * 60 * 1000)):
-        extra_caveats = extra_caveats or []
-        macaroon = self._generate_base_macaroon(user_id)
-        macaroon.add_first_party_caveat("type = access")
-        now = self.hs.get_clock().time_msec()
-        expiry = now + duration_in_ms
-        macaroon.add_first_party_caveat("time < %d" % (expiry,))
-        for caveat in extra_caveats:
-            macaroon.add_first_party_caveat(caveat)
-        return macaroon.serialize()
-
-    def generate_refresh_token(self, user_id):
-        m = self._generate_base_macaroon(user_id)
-        m.add_first_party_caveat("type = refresh")
-        # Important to add a nonce, because otherwise every refresh token for a
-        # user will be the same.
-        m.add_first_party_caveat("nonce = %s" % (
-            stringutils.random_string_with_symbols(16),
-        ))
-        return m.serialize()
-
-    def generate_short_term_login_token(self, user_id, duration_in_ms=(2 * 60 * 1000)):
-        macaroon = self._generate_base_macaroon(user_id)
-        macaroon.add_first_party_caveat("type = login")
-        now = self.hs.get_clock().time_msec()
-        expiry = now + duration_in_ms
-        macaroon.add_first_party_caveat("time < %d" % (expiry,))
-        return macaroon.serialize()
-
-    def generate_delete_pusher_token(self, user_id):
-        macaroon = self._generate_base_macaroon(user_id)
-        macaroon.add_first_party_caveat("type = delete_pusher")
-        return macaroon.serialize()
 
     def validate_short_term_login_token_and_get_user_id(self, login_token):
         auth_api = self.hs.get_auth()
@@ -580,15 +562,6 @@ class AuthHandler(BaseHandler):
             return user_id
         except Exception:
             raise AuthError(403, "Invalid token", errcode=Codes.FORBIDDEN)
-
-    def _generate_base_macaroon(self, user_id):
-        macaroon = pymacaroons.Macaroon(
-            location=self.hs.config.server_name,
-            identifier="key",
-            key=self.hs.config.macaroon_secret_key)
-        macaroon.add_first_party_caveat("gen = 1")
-        macaroon.add_first_party_caveat("user_id = %s" % (user_id,))
-        return macaroon
 
     @defer.inlineCallbacks
     def set_password(self, user_id, newpassword, requester=None):
@@ -618,7 +591,7 @@ class AuthHandler(BaseHandler):
         # types (mediums) of threepid. For now, we still use the existing
         # infrastructure, but this is the start of synapse gaining knowledge
         # of specific types of threepid (and fixes the fact that checking
-        # for the presenc eof an email address during password reset was
+        # for the presence of an email address during password reset was
         # case sensitive).
         if medium == 'email':
             address = address.lower()
@@ -627,6 +600,17 @@ class AuthHandler(BaseHandler):
             user_id, medium, address, validated_at,
             self.hs.get_clock().time_msec()
         )
+
+    @defer.inlineCallbacks
+    def delete_threepid(self, user_id, medium, address):
+        # 'Canonicalise' email addresses as per above
+        if medium == 'email':
+            address = address.lower()
+
+        ret = yield self.store.user_delete_threepid(
+            user_id, medium, address,
+        )
+        defer.returnValue(ret)
 
     def _save_session(self, session):
         # TODO: Persistent storage
@@ -667,10 +651,52 @@ class AuthHandler(BaseHandler):
             Whether self.hash(password) == stored_hash (bool).
         """
         if stored_hash:
-            return bcrypt.hashpw(password + self.hs.config.password_pepper,
-                                 stored_hash.encode('utf-8')) == stored_hash
+            return bcrypt.hashpw(password.encode('utf8') + self.hs.config.password_pepper,
+                                 stored_hash.encode('utf8')) == stored_hash
         else:
             return False
+
+
+class MacaroonGeneartor(object):
+    def __init__(self, hs):
+        self.clock = hs.get_clock()
+        self.server_name = hs.config.server_name
+        self.macaroon_secret_key = hs.config.macaroon_secret_key
+
+    def generate_access_token(self, user_id, extra_caveats=None):
+        extra_caveats = extra_caveats or []
+        macaroon = self._generate_base_macaroon(user_id)
+        macaroon.add_first_party_caveat("type = access")
+        # Include a nonce, to make sure that each login gets a different
+        # access token.
+        macaroon.add_first_party_caveat("nonce = %s" % (
+            stringutils.random_string_with_symbols(16),
+        ))
+        for caveat in extra_caveats:
+            macaroon.add_first_party_caveat(caveat)
+        return macaroon.serialize()
+
+    def generate_short_term_login_token(self, user_id, duration_in_ms=(2 * 60 * 1000)):
+        macaroon = self._generate_base_macaroon(user_id)
+        macaroon.add_first_party_caveat("type = login")
+        now = self.clock.time_msec()
+        expiry = now + duration_in_ms
+        macaroon.add_first_party_caveat("time < %d" % (expiry,))
+        return macaroon.serialize()
+
+    def generate_delete_pusher_token(self, user_id):
+        macaroon = self._generate_base_macaroon(user_id)
+        macaroon.add_first_party_caveat("type = delete_pusher")
+        return macaroon.serialize()
+
+    def _generate_base_macaroon(self, user_id):
+        macaroon = pymacaroons.Macaroon(
+            location=self.server_name,
+            identifier="key",
+            key=self.macaroon_secret_key)
+        macaroon.add_first_party_caveat("gen = 1")
+        macaroon.add_first_party_caveat("user_id = %s" % (user_id,))
+        return macaroon
 
 
 class _AccountHandler(object):

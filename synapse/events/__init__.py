@@ -36,6 +36,15 @@ class _EventInternalMetadata(object):
     def is_invite_from_remote(self):
         return getattr(self, "invite_from_remote", False)
 
+    def get_send_on_behalf_of(self):
+        """Whether this server should send the event on behalf of another server.
+        This is used by the federation "send_join" API to forward the initial join
+        event for a server in the room.
+
+        returns a str with the name of the server this event is sent on behalf of.
+        """
+        return getattr(self, "send_on_behalf_of", None)
+
 
 def _event_dict_property(key):
     def getter(self):
@@ -70,7 +79,6 @@ class EventBase(object):
     auth_events = _event_dict_property("auth_events")
     depth = _event_dict_property("depth")
     content = _event_dict_property("content")
-    event_id = _event_dict_property("event_id")
     hashes = _event_dict_property("hashes")
     origin = _event_dict_property("origin")
     origin_server_ts = _event_dict_property("origin_server_ts")
@@ -79,8 +87,6 @@ class EventBase(object):
     redacts = _event_dict_property("redacts")
     room_id = _event_dict_property("room_id")
     sender = _event_dict_property("sender")
-    state_key = _event_dict_property("state_key")
-    type = _event_dict_property("type")
     user_id = _event_dict_property("sender")
 
     @property
@@ -152,6 +158,11 @@ class FrozenEvent(EventBase):
             frozen_dict = freeze(event_dict)
         else:
             frozen_dict = event_dict
+
+        self.event_id = event_dict["event_id"]
+        self.type = event_dict["type"]
+        if "state_key" in event_dict:
+            self.state_key = event_dict["state_key"]
 
         super(FrozenEvent, self).__init__(
             frozen_dict,

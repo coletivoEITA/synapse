@@ -44,16 +44,19 @@ class RoomCreationHandler(BaseHandler):
             "join_rules": JoinRules.INVITE,
             "history_visibility": "shared",
             "original_invitees_have_ops": False,
+            "guest_can_join": True,
         },
         RoomCreationPreset.TRUSTED_PRIVATE_CHAT: {
             "join_rules": JoinRules.INVITE,
             "history_visibility": "shared",
             "original_invitees_have_ops": True,
+            "guest_can_join": True,
         },
         RoomCreationPreset.PUBLIC_CHAT: {
             "join_rules": JoinRules.PUBLIC,
             "history_visibility": "shared",
             "original_invitees_have_ops": False,
+            "guest_can_join": False,
         },
     }
 
@@ -72,7 +75,7 @@ class RoomCreationHandler(BaseHandler):
         """
         user_id = requester.user.to_string()
 
-        self.ratelimit(requester)
+        yield self.ratelimit(requester)
 
         if "room_alias_name" in config:
             for wchar in string.whitespace:
@@ -336,6 +339,13 @@ class RoomCreationHandler(BaseHandler):
                 content={"history_visibility": config["history_visibility"]}
             )
 
+        if config["guest_can_join"]:
+            if (EventTypes.GuestAccess, '') not in initial_state:
+                yield send(
+                    etype=EventTypes.GuestAccess,
+                    content={"guest_access": "can_join"}
+                )
+
         for (etype, state_key), content in initial_state.items():
             yield send(
                 etype=etype,
@@ -346,7 +356,7 @@ class RoomCreationHandler(BaseHandler):
 
 class RoomContextHandler(BaseHandler):
     @defer.inlineCallbacks
-    def get_event_context(self, user, room_id, event_id, limit, is_guest):
+    def get_event_context(self, user, room_id, event_id, limit):
         """Retrieves events, pagination tokens and state around a given event
         in a room.
 
@@ -365,12 +375,15 @@ class RoomContextHandler(BaseHandler):
 
         now_token = yield self.hs.get_event_sources().get_current_token()
 
+        users = yield self.store.get_users_in_room(room_id)
+        is_peeking = user.to_string() not in users
+
         def filter_evts(events):
             return filter_events_for_client(
                 self.store,
                 user.to_string(),
                 events,
-                is_peeking=is_guest
+                is_peeking=is_peeking
             )
 
         event = yield self.store.get_event(event_id, get_prev_content=True,
@@ -427,6 +440,7 @@ class RoomEventSource(object):
             limit,
             room_ids,
             is_guest,
+            explicit_room_id=None,
     ):
         # We just ignore the key for now.
 

@@ -19,6 +19,7 @@ from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import AuthError, Codes
 from synapse.events.utils import serialize_event
 from synapse.events.validator import EventValidator
+from synapse.handlers.presence import format_user_presence_state
 from synapse.streams.config import PaginationConfig
 from synapse.types import (
     UserID, StreamToken,
@@ -225,9 +226,17 @@ class InitialSyncHandler(BaseHandler):
                 "content": content,
             })
 
+        now = self.clock.time_msec()
+
         ret = {
             "rooms": rooms_ret,
-            "presence": presence,
+            "presence": [
+                {
+                    "type": "m.presence",
+                    "content": format_user_presence_state(event, now),
+                }
+                for event in presence
+            ],
             "account_data": account_data_events,
             "receipts": receipt,
             "end": now_token.to_string(),
@@ -372,11 +381,12 @@ class InitialSyncHandler(BaseHandler):
 
         @defer.inlineCallbacks
         def get_receipts():
-            receipts_handler = self.hs.get_handlers().receipts_handler
-            receipts = yield receipts_handler.get_receipts_for_room(
+            receipts = yield self.store.get_linearized_receipts_for_room(
                 room_id,
-                now_token.receipt_key
+                to_key=now_token.receipt_key,
             )
+            if not receipts:
+                receipts = []
             defer.returnValue(receipts)
 
         presence, receipts, (messages, token) = yield defer.gatherResults(

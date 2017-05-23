@@ -39,6 +39,7 @@ class ProfileTestCase(unittest.TestCase):
     def setUp(self):
         self.mock_federation = Mock(spec=[
             "make_query",
+            "register_edu_handler",
         ])
 
         self.query_handlers = {}
@@ -118,7 +119,8 @@ class ProfileTestCase(unittest.TestCase):
         self.mock_federation.make_query.assert_called_with(
             destination="remote",
             query_type="profile",
-            args={"user_id": "@alice:remote", "field": "displayname"}
+            args={"user_id": "@alice:remote", "field": "displayname"},
+            ignore_backoff=True,
         )
 
     @defer.inlineCallbacks

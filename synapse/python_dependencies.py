@@ -1,4 +1,5 @@
 # Copyright 2015, 2016 OpenMarket Ltd
+# Copyright 2017 Vector Creations Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +19,14 @@ from distutils.version import LooseVersion
 logger = logging.getLogger(__name__)
 
 REQUIREMENTS = {
+    "jsonschema>=2.5.1": ["jsonschema>=2.5.1"],
     "frozendict>=0.4": ["frozendict"],
     "unpaddedbase64>=1.1.0": ["unpaddedbase64>=1.1.0"],
     "canonicaljson>=1.0.0": ["canonicaljson>=1.0.0"],
     "signedjson>=1.0.0": ["signedjson>=1.0.0"],
     "pynacl==0.3.0": ["nacl==0.3.0", "nacl.bindings"],
     "service_identity>=1.0.0": ["service_identity>=1.0.0"],
-    "Twisted>=15.1.0": ["twisted>=15.1.0"],
+    "Twisted>=16.0.0": ["twisted>=16.0.0"],
     "pyopenssl>=0.14": ["OpenSSL>=0.14"],
     "pyyaml": ["yaml"],
     "pyasn1": ["pyasn1"],
@@ -37,6 +39,7 @@ REQUIREMENTS = {
     "pysaml2>=3.0.0,<4.0.0": ["saml2>=3.0.0,<4.0.0"],
     "pymacaroons-pynacl": ["pymacaroons"],
     "msgpack-python>=0.3.0": ["msgpack"],
+    "phonenumbers>=8.2.0": ["phonenumbers"],
 }
 CONDITIONAL_REQUIREMENTS = {
     "web_client": {
@@ -49,8 +52,8 @@ CONDITIONAL_REQUIREMENTS = {
         "Jinja2>=2.8": ["Jinja2>=2.8"],
         "bleach>=1.4.2": ["bleach>=1.4.2"],
     },
-    "ldap": {
-        "ldap3>=1.0": ["ldap3>=1.0"],
+    "matrix-synapse-ldap3": {
+        "matrix-synapse-ldap3>=0.1": ["ldap_auth_provider"],
     },
     "psutil": {
         "psutil>=2.0.0": ["psutil>=2.0.0"],
@@ -68,6 +71,7 @@ def requirements(config=None, include_conditional=False):
 
 def github_link(project, version, egg):
     return "https://github.com/%s/tarball/%s/#egg=%s" % (project, version, egg)
+
 
 DEPENDENCY_LINKS = {
 }
@@ -155,6 +159,7 @@ def list_requirements():
         if not is_linked:
             result.append(requirement)
     return result
+
 
 if __name__ == "__main__":
     import sys

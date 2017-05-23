@@ -21,7 +21,9 @@ from synapse.api.constants import (
     EventTypes, JoinRules,
 )
 from synapse.util.async import concurrently_execute
+from synapse.util.caches.descriptors import cachedInlineCallbacks
 from synapse.util.caches.response_cache import ResponseCache
+from synapse.types import ThirdPartyInstanceID
 
 from collections import namedtuple
 from unpaddedbase64 import encode_base64, decode_base64
@@ -34,6 +36,10 @@ logger = logging.getLogger(__name__)
 REMOTE_ROOM_LIST_POLL_INTERVAL = 60 * 1000
 
 
+# This is used to indicate we should only return rooms published to the main list.
+EMTPY_THIRD_PARTY_ID = ThirdPartyInstanceID(None, None)
+
+
 class RoomListHandler(BaseHandler):
     def __init__(self, hs):
         super(RoomListHandler, self).__init__(hs)
@@ -41,22 +47,48 @@ class RoomListHandler(BaseHandler):
         self.remote_response_cache = ResponseCache(hs, timeout_ms=30 * 1000)
 
     def get_local_public_room_list(self, limit=None, since_token=None,
-                                   search_filter=None):
-        if search_filter:
-            # We explicitly don't bother caching searches.
-            return self._get_public_room_list(limit, since_token, search_filter)
+                                   search_filter=None,
+                                   network_tuple=EMTPY_THIRD_PARTY_ID,):
+        """Generate a local public room list.
 
-        result = self.response_cache.get((limit, since_token))
+        There are multiple different lists: the main one plus one per third
+        party network. A client can ask for a specific list or to return all.
+
+        Args:
+            limit (int)
+            since_token (str)
+            search_filter (dict)
+            network_tuple (ThirdPartyInstanceID): Which public list to use.
+                This can be (None, None) to indicate the main list, or a particular
+                appservice and network id to use an appservice specific one.
+                Setting to None returns all public rooms across all lists.
+        """
+        logger.info(
+            "Getting public room list: limit=%r, since=%r, search=%r, network=%r",
+            limit, since_token, bool(search_filter), network_tuple,
+        )
+        if search_filter:
+            # We explicitly don't bother caching searches or requests for
+            # appservice specific lists.
+            return self._get_public_room_list(
+                limit, since_token, search_filter, network_tuple=network_tuple,
+            )
+
+        key = (limit, since_token, network_tuple)
+        result = self.response_cache.get(key)
         if not result:
             result = self.response_cache.set(
-                (limit, since_token),
-                self._get_public_room_list(limit, since_token)
+                key,
+                self._get_public_room_list(
+                    limit, since_token, network_tuple=network_tuple
+                )
             )
         return result
 
     @defer.inlineCallbacks
     def _get_public_room_list(self, limit=None, since_token=None,
-                              search_filter=None):
+                              search_filter=None,
+                              network_tuple=EMTPY_THIRD_PARTY_ID,):
         if since_token and since_token != "END":
             since_token = RoomListNextBatch.from_token(since_token)
         else:
@@ -64,7 +96,6 @@ class RoomListHandler(BaseHandler):
 
         rooms_to_order_value = {}
         rooms_to_num_joined = {}
-        rooms_to_latest_event_ids = {}
 
         newly_visible = []
         newly_unpublished = []
@@ -73,14 +104,15 @@ class RoomListHandler(BaseHandler):
             current_public_id = yield self.store.get_current_public_room_stream_id()
             public_room_stream_id = since_token.public_room_stream_id
             newly_visible, newly_unpublished = yield self.store.get_public_room_changes(
-                public_room_stream_id, current_public_id
+                public_room_stream_id, current_public_id,
+                network_tuple=network_tuple,
             )
         else:
             stream_token = yield self.store.get_room_max_stream_ordering()
             public_room_stream_id = yield self.store.get_current_public_room_stream_id()
 
         room_ids = yield self.store.get_public_room_ids_at_stream_id(
-            public_room_stream_id
+            public_room_stream_id, network_tuple=network_tuple,
         )
 
         # We want to return rooms in a particular order: the number of joined
@@ -88,19 +120,26 @@ class RoomListHandler(BaseHandler):
 
         @defer.inlineCallbacks
         def get_order_for_room(room_id):
-            latest_event_ids = rooms_to_latest_event_ids.get(room_id, None)
-            if not latest_event_ids:
+            # Most of the rooms won't have changed between the since token and
+            # now (especially if the since token is "now"). So, we can ask what
+            # the current users are in a room (that will hit a cache) and then
+            # check if the room has changed since the since token. (We have to
+            # do it in that order to avoid races).
+            # If things have changed then fall back to getting the current state
+            # at the since token.
+            joined_users = yield self.store.get_users_in_room(room_id)
+            if self.store.has_room_changed_since(room_id, stream_token):
                 latest_event_ids = yield self.store.get_forward_extremeties_for_room(
                     room_id, stream_token
                 )
-                rooms_to_latest_event_ids[room_id] = latest_event_ids
 
-            if not latest_event_ids:
-                return
+                if not latest_event_ids:
+                    return
 
-            joined_users = yield self.state_handler.get_current_user_in_room(
-                room_id, latest_event_ids,
-            )
+                joined_users = yield self.state_handler.get_current_user_in_room(
+                    room_id, latest_event_ids,
+                )
+
             num_joined_users = len(joined_users)
             rooms_to_num_joined[room_id] = num_joined_users
 
@@ -137,19 +176,19 @@ class RoomListHandler(BaseHandler):
                 rooms_to_scan = rooms_to_scan[:since_token.current_limit]
                 rooms_to_scan.reverse()
 
-        # Actually generate the entries. _generate_room_entry will append to
+        # Actually generate the entries. _append_room_entry_to_chunk will append to
         # chunk but will stop if len(chunk) > limit
         chunk = []
         if limit and not search_filter:
             step = limit + 1
             for i in xrange(0, len(rooms_to_scan), step):
                 # We iterate here because the vast majority of cases we'll stop
-                # at first iteration, but occaisonally _generate_room_entry
+                # at first iteration, but occaisonally _append_room_entry_to_chunk
                 # won't append to the chunk and so we need to loop again.
                 # We don't want to scan over the entire range either as that
                 # would potentially waste a lot of work.
                 yield concurrently_execute(
-                    lambda r: self._generate_room_entry(
+                    lambda r: self._append_room_entry_to_chunk(
                         r, rooms_to_num_joined[r],
                         chunk, limit, search_filter
                     ),
@@ -159,7 +198,7 @@ class RoomListHandler(BaseHandler):
                     break
         else:
             yield concurrently_execute(
-                lambda r: self._generate_room_entry(
+                lambda r: self._append_room_entry_to_chunk(
                     r, rooms_to_num_joined[r],
                     chunk, limit, search_filter
                 ),
@@ -228,21 +267,35 @@ class RoomListHandler(BaseHandler):
         defer.returnValue(results)
 
     @defer.inlineCallbacks
-    def _generate_room_entry(self, room_id, num_joined_users, chunk, limit,
-                             search_filter):
+    def _append_room_entry_to_chunk(self, room_id, num_joined_users, chunk, limit,
+                                    search_filter):
+        """Generate the entry for a room in the public room list and append it
+        to the `chunk` if it matches the search filter
+        """
         if limit and len(chunk) > limit + 1:
             # We've already got enough, so lets just drop it.
             return
 
+        result = yield self._generate_room_entry(room_id, num_joined_users)
+
+        if result and _matches_room_entry(result, search_filter):
+            chunk.append(result)
+
+    @cachedInlineCallbacks(num_args=1, cache_context=True)
+    def _generate_room_entry(self, room_id, num_joined_users, cache_context):
+        """Returns the entry for a room
+        """
         result = {
             "room_id": room_id,
             "num_joined_members": num_joined_users,
         }
 
-        current_state_ids = yield self.state_handler.get_current_state_ids(room_id)
+        current_state_ids = yield self.store.get_current_state_ids(
+            room_id, on_invalidate=cache_context.invalidate,
+        )
 
         event_map = yield self.store.get_events([
-            event_id for key, event_id in current_state_ids.items()
+            event_id for key, event_id in current_state_ids.iteritems()
             if key[0] in (
                 EventTypes.JoinRules,
                 EventTypes.Name,
@@ -266,7 +319,9 @@ class RoomListHandler(BaseHandler):
             if join_rule and join_rule != JoinRules.PUBLIC:
                 defer.returnValue(None)
 
-        aliases = yield self.store.get_aliases_for_room(room_id)
+        aliases = yield self.store.get_aliases_for_room(
+            room_id, on_invalidate=cache_context.invalidate
+        )
         if aliases:
             result["aliases"] = aliases
 
@@ -306,12 +361,12 @@ class RoomListHandler(BaseHandler):
             if avatar_url:
                 result["avatar_url"] = avatar_url
 
-        if _matches_room_entry(result, search_filter):
-            chunk.append(result)
+        defer.returnValue(result)
 
     @defer.inlineCallbacks
     def get_remote_public_room_list(self, server_name, limit=None, since_token=None,
-                                    search_filter=None):
+                                    search_filter=None, include_all_networks=False,
+                                    third_party_instance_id=None,):
         if search_filter:
             # We currently don't support searching across federation, so we have
             # to do it manually without pagination
@@ -320,6 +375,8 @@ class RoomListHandler(BaseHandler):
 
         res = yield self._get_remote_list_cached(
             server_name, limit=limit, since_token=since_token,
+            include_all_networks=include_all_networks,
+            third_party_instance_id=third_party_instance_id,
         )
 
         if search_filter:
@@ -332,22 +389,30 @@ class RoomListHandler(BaseHandler):
         defer.returnValue(res)
 
     def _get_remote_list_cached(self, server_name, limit=None, since_token=None,
-                                search_filter=None):
+                                search_filter=None, include_all_networks=False,
+                                third_party_instance_id=None,):
         repl_layer = self.hs.get_replication_layer()
         if search_filter:
             # We can't cache when asking for search
             return repl_layer.get_public_rooms(
                 server_name, limit=limit, since_token=since_token,
-                search_filter=search_filter,
+                search_filter=search_filter, include_all_networks=include_all_networks,
+                third_party_instance_id=third_party_instance_id,
             )
 
-        result = self.remote_response_cache.get((server_name, limit, since_token))
+        key = (
+            server_name, limit, since_token, include_all_networks,
+            third_party_instance_id,
+        )
+        result = self.remote_response_cache.get(key)
         if not result:
             result = self.remote_response_cache.set(
-                (server_name, limit, since_token),
+                key,
                 repl_layer.get_public_rooms(
                     server_name, limit=limit, since_token=since_token,
                     search_filter=search_filter,
+                    include_all_networks=include_all_networks,
+                    third_party_instance_id=third_party_instance_id,
                 )
             )
         return result

@@ -16,10 +16,11 @@
 from synapse.api.constants import Membership, EventTypes
 from synapse.util.async import concurrently_execute
 from synapse.util.logcontext import LoggingContext
-from synapse.util.metrics import Measure
+from synapse.util.metrics import Measure, measure_func
 from synapse.util.caches.response_cache import ResponseCache
 from synapse.push.clientformat import format_push_rules_for_user
 from synapse.visibility import filter_events_for_client
+from synapse.types import RoomStreamToken
 
 from twisted.internet import defer
 
@@ -115,6 +116,7 @@ class SyncResult(collections.namedtuple("SyncResult", [
     "invited",  # InvitedSyncResult for each invited room.
     "archived",  # ArchivedSyncResult for each archived room.
     "to_device",  # List of direct messages for the device.
+    "device_lists",  # List of user_ids whose devices have chanegd
 ])):
     __slots__ = []
 
@@ -129,7 +131,8 @@ class SyncResult(collections.namedtuple("SyncResult", [
             self.invited or
             self.archived or
             self.account_data or
-            self.to_device
+            self.to_device or
+            self.device_lists
         )
 
 
@@ -223,8 +226,7 @@ class SyncHandler(object):
         with Measure(self.clock, "ephemeral_by_room"):
             typing_key = since_token.typing_key if since_token else "0"
 
-            rooms = yield self.store.get_rooms_for_user(sync_config.user.to_string())
-            room_ids = [room.room_id for room in rooms]
+            room_ids = yield self.store.get_rooms_for_user(sync_config.user.to_string())
 
             typing_source = self.event_sources.sources["typing"]
             typing, typing_key = yield typing_source.get_new_events(
@@ -277,6 +279,7 @@ class SyncHandler(object):
         """
         with Measure(self.clock, "load_filtered_recents"):
             timeline_limit = sync_config.filter_collection.timeline_limit()
+            block_all_timeline = sync_config.filter_collection.blocks_all_room_timeline()
 
             if recents is None or newly_joined_room or timeline_limit < len(recents):
                 limited = True
@@ -293,7 +296,7 @@ class SyncHandler(object):
             else:
                 recents = []
 
-            if not limited:
+            if not limited or block_all_timeline:
                 defer.returnValue(TimelineBatch(
                     events=recents,
                     prev_batch=now_token,
@@ -509,6 +512,7 @@ class SyncHandler(object):
         Returns:
             Deferred(SyncResult)
         """
+        logger.info("Calculating sync response for %r", sync_config.user)
 
         # NB: The now_token gets changed by some of the generate_sync_* methods,
         # this is due to some of the underlying streams not supporting the ability
@@ -531,11 +535,20 @@ class SyncHandler(object):
         )
         newly_joined_rooms, newly_joined_users = res
 
-        yield self._generate_sync_entry_for_presence(
-            sync_result_builder, newly_joined_rooms, newly_joined_users
+        block_all_presence_data = (
+            since_token is None and
+            sync_config.filter_collection.blocks_all_presence()
         )
+        if not block_all_presence_data:
+            yield self._generate_sync_entry_for_presence(
+                sync_result_builder, newly_joined_rooms, newly_joined_users
+            )
 
         yield self._generate_sync_entry_for_to_device(sync_result_builder)
+
+        device_lists = yield self._generate_sync_entry_for_device_list(
+            sync_result_builder
+        )
 
         defer.returnValue(SyncResult(
             presence=sync_result_builder.presence,
@@ -544,8 +557,31 @@ class SyncHandler(object):
             invited=sync_result_builder.invited,
             archived=sync_result_builder.archived,
             to_device=sync_result_builder.to_device,
+            device_lists=device_lists,
             next_batch=sync_result_builder.now_token,
         ))
+
+    @measure_func("_generate_sync_entry_for_device_list")
+    @defer.inlineCallbacks
+    def _generate_sync_entry_for_device_list(self, sync_result_builder):
+        user_id = sync_result_builder.sync_config.user.to_string()
+        since_token = sync_result_builder.since_token
+
+        if since_token and since_token.device_list_key:
+            room_ids = yield self.store.get_rooms_for_user(user_id)
+
+            user_ids_changed = set()
+            changed = yield self.store.get_user_whose_devices_changed(
+                since_token.device_list_key
+            )
+            for other_user_id in changed:
+                other_room_ids = yield self.store.get_rooms_for_user(other_user_id)
+                if room_ids.intersection(other_room_ids):
+                    user_ids_changed.add(other_user_id)
+
+            defer.returnValue(user_ids_changed)
+        else:
+            defer.returnValue([])
 
     @defer.inlineCallbacks
     def _generate_sync_entry_for_to_device(self, sync_result_builder):
@@ -569,16 +605,20 @@ class SyncHandler(object):
             # We only delete messages when a new message comes in, but that's
             # fine so long as we delete them at some point.
 
-            logger.debug("Deleting messages up to %d", since_stream_id)
-            yield self.store.delete_messages_for_device(
+            deleted = yield self.store.delete_messages_for_device(
                 user_id, device_id, since_stream_id
             )
+            logger.debug("Deleted %d to-device messages up to %d",
+                         deleted, since_stream_id)
 
-            logger.debug("Getting messages up to %d", now_token.to_device_key)
             messages, stream_id = yield self.store.get_new_messages_for_device(
                 user_id, device_id, since_stream_id, now_token.to_device_key
             )
-            logger.debug("Got messages up to %d: %r", stream_id, messages)
+
+            logger.debug(
+                "Returning %d to-device messages between %d and %d (current token: %d)",
+                len(messages), since_stream_id, stream_id, now_token.to_device_key
+            )
             sync_result_builder.now_token = now_token.copy_and_replace(
                 "to_device_key", stream_id
             )
@@ -680,14 +720,14 @@ class SyncHandler(object):
             extra_users_ids.update(users)
         extra_users_ids.discard(user.to_string())
 
-        states = yield self.presence_handler.get_states(
-            extra_users_ids,
-            as_event=True,
-        )
-        presence.extend(states)
+        if extra_users_ids:
+            states = yield self.presence_handler.get_states(
+                extra_users_ids,
+            )
+            presence.extend(states)
 
-        # Deduplicate the presence entries so that there's at most one per user
-        presence = {p["content"]["user_id"]: p for p in presence}.values()
+            # Deduplicate the presence entries so that there's at most one per user
+            presence = {p.user_id: p for p in presence}.values()
 
         presence = sync_config.filter_collection.filter_presence(
             presence
@@ -709,13 +749,35 @@ class SyncHandler(object):
             `(newly_joined_rooms, newly_joined_users)`
         """
         user_id = sync_result_builder.sync_config.user.to_string()
-
-        now_token, ephemeral_by_room = yield self.ephemeral_by_room(
-            sync_result_builder.sync_config,
-            now_token=sync_result_builder.now_token,
-            since_token=sync_result_builder.since_token,
+        block_all_room_ephemeral = (
+            sync_result_builder.since_token is None and
+            sync_result_builder.sync_config.filter_collection.blocks_all_room_ephemeral()
         )
-        sync_result_builder.now_token = now_token
+
+        if block_all_room_ephemeral:
+            ephemeral_by_room = {}
+        else:
+            now_token, ephemeral_by_room = yield self.ephemeral_by_room(
+                sync_result_builder.sync_config,
+                now_token=sync_result_builder.now_token,
+                since_token=sync_result_builder.since_token,
+            )
+            sync_result_builder.now_token = now_token
+
+        # We check up front if anything has changed, if it hasn't then there is
+        # no point in going futher.
+        since_token = sync_result_builder.since_token
+        if not sync_result_builder.full_state:
+            if since_token and not ephemeral_by_room and not account_data_by_room:
+                have_changed = yield self._have_rooms_changed(sync_result_builder)
+                if not have_changed:
+                    tags_by_room = yield self.store.get_updated_tags(
+                        user_id,
+                        since_token.account_data_key,
+                    )
+                    if not tags_by_room:
+                        logger.debug("no-oping sync")
+                        defer.returnValue(([], []))
 
         ignored_account_data = yield self.store.get_global_account_data_by_type_for_user(
             "m.ignored_user_list", user_id=user_id,
@@ -726,13 +788,12 @@ class SyncHandler(object):
         else:
             ignored_users = frozenset()
 
-        if sync_result_builder.since_token:
+        if since_token:
             res = yield self._get_rooms_changed(sync_result_builder, ignored_users)
             room_entries, invited, newly_joined_rooms = res
 
             tags_by_room = yield self.store.get_updated_tags(
-                user_id,
-                sync_result_builder.since_token.account_data_key,
+                user_id, since_token.account_data_key,
             )
         else:
             res = yield self._get_all_rooms(sync_result_builder, ignored_users)
@@ -757,7 +818,7 @@ class SyncHandler(object):
 
         # Now we want to get any newly joined users
         newly_joined_users = set()
-        if sync_result_builder.since_token:
+        if since_token:
             for joined_sync in sync_result_builder.joined:
                 it = itertools.chain(
                     joined_sync.timeline.events, joined_sync.state.values()
@@ -768,6 +829,38 @@ class SyncHandler(object):
                             newly_joined_users.add(event.state_key)
 
         defer.returnValue((newly_joined_rooms, newly_joined_users))
+
+    @defer.inlineCallbacks
+    def _have_rooms_changed(self, sync_result_builder):
+        """Returns whether there may be any new events that should be sent down
+        the sync. Returns True if there are.
+        """
+        user_id = sync_result_builder.sync_config.user.to_string()
+        since_token = sync_result_builder.since_token
+        now_token = sync_result_builder.now_token
+
+        assert since_token
+
+        # Get a list of membership change events that have happened.
+        rooms_changed = yield self.store.get_membership_changes_for_user(
+            user_id, since_token.room_key, now_token.room_key
+        )
+
+        if rooms_changed:
+            defer.returnValue(True)
+
+        app_service = self.store.get_app_service_by_user_id(user_id)
+        if app_service:
+            rooms = yield self.store.get_app_service_rooms(app_service)
+            joined_room_ids = set(r.room_id for r in rooms)
+        else:
+            joined_room_ids = yield self.store.get_rooms_for_user(user_id)
+
+        stream_id = RoomStreamToken.parse_stream_token(since_token.room_key).stream
+        for room_id in joined_room_ids:
+            if self.store.has_room_changed_since(room_id, stream_id):
+                defer.returnValue(True)
+        defer.returnValue(False)
 
     @defer.inlineCallbacks
     def _get_rooms_changed(self, sync_result_builder, ignored_users):
@@ -793,8 +886,7 @@ class SyncHandler(object):
             rooms = yield self.store.get_app_service_rooms(app_service)
             joined_room_ids = set(r.room_id for r in rooms)
         else:
-            rooms = yield self.store.get_rooms_for_user(user_id)
-            joined_room_ids = set(r.room_id for r in rooms)
+            joined_room_ids = yield self.store.get_rooms_for_user(user_id)
 
         # Get a list of membership change events that have happened.
         rooms_changed = yield self.store.get_membership_changes_for_user(

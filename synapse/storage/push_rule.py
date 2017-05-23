@@ -16,6 +16,7 @@
 from ._base import SQLBaseStore
 from synapse.util.caches.descriptors import cachedInlineCallbacks, cachedList
 from synapse.push.baserules import list_with_base_rules
+from synapse.api.constants import EventTypes
 from twisted.internet import defer
 
 import logging
@@ -156,12 +157,20 @@ class PushRuleStore(SQLBaseStore):
             event=event,
         )
 
-        local_users_in_room = set(u for u in users_in_room if self.hs.is_mine_id(u))
+        # We ignore app service users for now. This is so that we don't fill
+        # up the `get_if_users_have_pushers` cache with AS entries that we
+        # know don't have pushers, nor even read receipts.
+        local_users_in_room = set(
+            u for u in users_in_room
+            if self.hs.is_mine_id(u)
+            and not self.get_if_app_services_interested_in_user(u)
+        )
 
         # users in the room who have pushers need to get push rules run because
         # that's how their pushers work
         if_users_with_pushers = yield self.get_if_users_have_pushers(
-            local_users_in_room, on_invalidate=cache_context.invalidate,
+            local_users_in_room,
+            on_invalidate=cache_context.invalidate,
         )
         user_ids = set(
             uid for uid, have_pusher in if_users_with_pushers.items() if have_pusher
@@ -175,6 +184,18 @@ class PushRuleStore(SQLBaseStore):
         for uid in users_with_receipts:
             if uid in local_users_in_room:
                 user_ids.add(uid)
+
+        forgotten = yield self.who_forgot_in_room(
+            event.room_id, on_invalidate=cache_context.invalidate,
+        )
+
+        for row in forgotten:
+            user_id = row["user_id"]
+            event_id = row["event_id"]
+
+            mem_id = current_state_ids.get((EventTypes.Member, user_id), None)
+            if event_id == mem_id:
+                user_ids.discard(user_id)
 
         rules_by_user = yield self.bulk_get_push_rules(
             user_ids, on_invalidate=cache_context.invalidate,

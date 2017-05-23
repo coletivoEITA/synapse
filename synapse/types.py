@@ -56,10 +56,10 @@ def create_requester(user_id, access_token_id=None, is_guest=False,
 
 
 def get_domain_from_id(string):
-    try:
-        return string.split(":", 1)[1]
-    except IndexError:
+    idx = string.find(":")
+    if idx == -1:
         raise SynapseError(400, "Invalid ID: %r" % (string,))
+    return string[idx + 1:]
 
 
 class DomainSpecificString(
@@ -158,6 +158,7 @@ class StreamToken(
         "account_data_key",
         "push_rules_key",
         "to_device_key",
+        "device_list_key",
     ))
 ):
     _SEPARATOR = "_"
@@ -195,6 +196,7 @@ class StreamToken(
             or (int(other.account_data_key) < int(self.account_data_key))
             or (int(other.push_rules_key) < int(self.push_rules_key))
             or (int(other.to_device_key) < int(self.to_device_key))
+            or (int(other.device_list_key) < int(self.device_list_key))
         )
 
     def copy_and_advance(self, key, new_value):
@@ -214,9 +216,7 @@ class StreamToken(
             return self
 
     def copy_and_replace(self, key, new_value):
-        d = self._asdict()
-        d[key] = new_value
-        return StreamToken(**d)
+        return self._replace(**{key: new_value})
 
 
 StreamToken.START = StreamToken(
@@ -274,3 +274,37 @@ class RoomStreamToken(namedtuple("_StreamToken", "topological stream")):
             return "t%d-%d" % (self.topological, self.stream)
         else:
             return "s%d" % (self.stream,)
+
+
+class ThirdPartyInstanceID(
+        namedtuple("ThirdPartyInstanceID", ("appservice_id", "network_id"))
+):
+    # Deny iteration because it will bite you if you try to create a singleton
+    # set by:
+    #    users = set(user)
+    def __iter__(self):
+        raise ValueError("Attempted to iterate a %s" % (type(self).__name__,))
+
+    # Because this class is a namedtuple of strings, it is deeply immutable.
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    @classmethod
+    def from_string(cls, s):
+        bits = s.split("|", 2)
+        if len(bits) != 2:
+            raise SynapseError(400, "Invalid ID %r" % (s,))
+
+        return cls(appservice_id=bits[0], network_id=bits[1])
+
+    def to_string(self):
+        return "%s|%s" % (self.appservice_id, self.network_id,)
+
+    __str__ = to_string
+
+    @classmethod
+    def create(cls, appservice_id, network_id,):
+        return cls(appservice_id=appservice_id, network_id=network_id)

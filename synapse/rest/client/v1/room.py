@@ -21,7 +21,7 @@ from synapse.api.errors import SynapseError, Codes, AuthError
 from synapse.streams.config import PaginationConfig
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.filtering import Filter
-from synapse.types import UserID, RoomID, RoomAlias
+from synapse.types import UserID, RoomID, RoomAlias, ThirdPartyInstanceID
 from synapse.events.utils import serialize_event, format_event_for_client_v2
 from synapse.http.servlet import (
     parse_json_object_from_request, parse_string, parse_integer
@@ -152,23 +152,30 @@ class RoomStateEventRestServlet(ClientV1RestServlet):
         if state_key is not None:
             event_dict["state_key"] = state_key
 
-        msg_handler = self.handlers.message_handler
-        event, context = yield msg_handler.create_event(
-            event_dict,
-            token_id=requester.access_token_id,
-            txn_id=txn_id,
-        )
-
         if event_type == EventTypes.Member:
-            yield self.handlers.room_member_handler.send_membership_event(
+            membership = content.get("membership", None)
+            event = yield self.handlers.room_member_handler.update_membership(
                 requester,
-                event,
-                context,
+                target=UserID.from_string(state_key),
+                room_id=room_id,
+                action=membership,
+                content=content,
             )
         else:
+            msg_handler = self.handlers.message_handler
+            event, context = yield msg_handler.create_event(
+                requester,
+                event_dict,
+                token_id=requester.access_token_id,
+                txn_id=txn_id,
+            )
+
             yield msg_handler.send_nonmember_event(requester, event, context)
 
-        defer.returnValue((200, {"event_id": event.event_id}))
+        ret = {}
+        if event:
+            ret = {"event_id": event.event_id}
+        defer.returnValue((200, ret))
 
 
 # TODO: Needs unit testing for generic events + feedback
@@ -321,6 +328,20 @@ class PublicRoomListRestServlet(ClientV1RestServlet):
         since_token = content.get("since", None)
         search_filter = content.get("filter", None)
 
+        include_all_networks = content.get("include_all_networks", False)
+        third_party_instance_id = content.get("third_party_instance_id", None)
+
+        if include_all_networks:
+            network_tuple = None
+            if third_party_instance_id is not None:
+                raise SynapseError(
+                    400, "Can't use include_all_networks with an explicit network"
+                )
+        elif third_party_instance_id is None:
+            network_tuple = ThirdPartyInstanceID(None, None)
+        else:
+            network_tuple = ThirdPartyInstanceID.from_string(third_party_instance_id)
+
         handler = self.hs.get_room_list_handler()
         if server:
             data = yield handler.get_remote_public_room_list(
@@ -328,12 +349,15 @@ class PublicRoomListRestServlet(ClientV1RestServlet):
                 limit=limit,
                 since_token=since_token,
                 search_filter=search_filter,
+                include_all_networks=include_all_networks,
+                third_party_instance_id=third_party_instance_id,
             )
         else:
             data = yield handler.get_local_public_room_list(
                 limit=limit,
                 since_token=since_token,
                 search_filter=search_filter,
+                network_tuple=network_tuple,
             )
 
         defer.returnValue((200, data))
@@ -366,6 +390,30 @@ class RoomMemberListRestServlet(ClientV1RestServlet):
 
         defer.returnValue((200, {
             "chunk": chunk
+        }))
+
+
+class JoinedRoomMemberListRestServlet(ClientV1RestServlet):
+    PATTERNS = client_path_patterns("/rooms/(?P<room_id>[^/]*)/joined_members$")
+
+    def __init__(self, hs):
+        super(JoinedRoomMemberListRestServlet, self).__init__(hs)
+        self.state = hs.get_state_handler()
+
+    @defer.inlineCallbacks
+    def on_GET(self, request, room_id):
+        yield self.auth.get_user_by_req(request)
+
+        users_with_profile = yield self.state.get_current_user_in_room(room_id)
+
+        defer.returnValue((200, {
+            "joined": {
+                user_id: {
+                    "avatar_url": profile.avatar_url,
+                    "display_name": profile.display_name,
+                }
+                for user_id, profile in users_with_profile.iteritems()
+            }
         }))
 
 
@@ -464,7 +512,6 @@ class RoomEventContext(ClientV1RestServlet):
             room_id,
             event_id,
             limit,
-            requester.is_guest,
         )
 
         if not results:
@@ -568,6 +615,10 @@ class RoomMembershipRestServlet(ClientV1RestServlet):
                 raise SynapseError(400, "Missing user_id key.")
             target = UserID.from_string(content["user_id"])
 
+        event_content = None
+        if 'reason' in content and membership_action in ['kick', 'ban']:
+            event_content = {'reason': content['reason']}
+
         yield self.handlers.room_member_handler.update_membership(
             requester=requester,
             target=target,
@@ -575,6 +626,7 @@ class RoomMembershipRestServlet(ClientV1RestServlet):
             action=membership_action,
             txn_id=txn_id,
             third_party_signed=content.get("third_party_signed", None),
+            content=event_content,
         )
 
         defer.returnValue((200, {}))
@@ -692,6 +744,21 @@ class SearchRestServlet(ClientV1RestServlet):
         defer.returnValue((200, results))
 
 
+class JoinedRoomsRestServlet(ClientV1RestServlet):
+    PATTERNS = client_path_patterns("/joined_rooms$")
+
+    def __init__(self, hs):
+        super(JoinedRoomsRestServlet, self).__init__(hs)
+        self.store = hs.get_datastore()
+
+    @defer.inlineCallbacks
+    def on_GET(self, request):
+        requester = yield self.auth.get_user_by_req(request, allow_guest=True)
+
+        room_ids = yield self.store.get_rooms_for_user(requester.user.to_string())
+        defer.returnValue((200, {"joined_rooms": list(room_ids)}))
+
+
 def register_txn_path(servlet, regex_string, http_server, with_get=False):
     """Registers a transaction-based path.
 
@@ -727,6 +794,7 @@ def register_servlets(hs, http_server):
     RoomStateEventRestServlet(hs).register(http_server)
     RoomCreateRestServlet(hs).register(http_server)
     RoomMemberListRestServlet(hs).register(http_server)
+    JoinedRoomMemberListRestServlet(hs).register(http_server)
     RoomMessageListRestServlet(hs).register(http_server)
     JoinRoomAliasServlet(hs).register(http_server)
     RoomForgetRestServlet(hs).register(http_server)
@@ -738,4 +806,5 @@ def register_servlets(hs, http_server):
     RoomRedactEventRestServlet(hs).register(http_server)
     RoomTypingRestServlet(hs).register(http_server)
     SearchRestServlet(hs).register(http_server)
+    JoinedRoomsRestServlet(hs).register(http_server)
     RoomEventContext(hs).register(http_server)

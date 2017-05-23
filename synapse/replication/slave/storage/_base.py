@@ -15,7 +15,6 @@
 
 from synapse.storage._base import SQLBaseStore
 from synapse.storage.engines import PostgresEngine
-from twisted.internet import defer
 
 from ._slaved_id_tracker import SlavedIdTracker
 
@@ -34,23 +33,28 @@ class BaseSlavedStore(SQLBaseStore):
         else:
             self._cache_id_gen = None
 
+        self.hs = hs
+
     def stream_positions(self):
         pos = {}
         if self._cache_id_gen:
             pos["caches"] = self._cache_id_gen.get_current_token()
         return pos
 
-    def process_replication(self, result):
-        stream = result.get("caches")
-        if stream:
-            for row in stream["rows"]:
-                (
-                    position, cache_func, keys, invalidation_ts,
-                ) = row
-
+    def process_replication_rows(self, stream_name, token, rows):
+        if stream_name == "caches":
+            self._cache_id_gen.advance(token)
+            for row in rows:
                 try:
-                    getattr(self, cache_func).invalidate(tuple(keys))
+                    getattr(self, row.cache_func).invalidate(tuple(row.keys))
                 except AttributeError:
-                    logger.info("Got unexpected cache_func: %r", cache_func)
-            self._cache_id_gen.advance(int(stream["position"]))
-        return defer.succeed(None)
+                    # We probably haven't pulled in the cache in this worker,
+                    # which is fine.
+                    pass
+
+    def _invalidate_cache_and_stream(self, txn, cache_func, keys):
+        txn.call_after(cache_func.invalidate, keys)
+        txn.call_after(self._send_invalidation_poke, cache_func, keys)
+
+    def _send_invalidation_poke(self, cache_func, keys):
+        self.hs.get_tcp_replication().send_invalidate_cache(cache_func, keys)

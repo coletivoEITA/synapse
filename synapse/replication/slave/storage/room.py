@@ -15,6 +15,7 @@
 
 from ._base import BaseSlavedStore
 from synapse.storage import DataStore
+from synapse.storage.room import RoomStore
 from ._slaved_id_tracker import SlavedIdTracker
 
 
@@ -30,7 +31,7 @@ class RoomStore(BaseSlavedStore):
         DataStore.get_current_public_room_stream_id.__func__
     )
     get_public_room_ids_at_stream_id = (
-        DataStore.get_public_room_ids_at_stream_id.__func__
+        RoomStore.__dict__["get_public_room_ids_at_stream_id"]
     )
     get_public_room_ids_at_stream_id_txn = (
         DataStore.get_public_room_ids_at_stream_id_txn.__func__
@@ -45,9 +46,10 @@ class RoomStore(BaseSlavedStore):
         result["public_rooms"] = self._public_room_id_gen.get_current_token()
         return result
 
-    def process_replication(self, result):
-        stream = result.get("public_rooms")
-        if stream:
-            self._public_room_id_gen.advance(int(stream["position"]))
+    def process_replication_rows(self, stream_name, token, rows):
+        if stream_name == "public_rooms":
+            self._public_room_id_gen.advance(token)
 
-        return super(RoomStore, self).process_replication(result)
+        return super(RoomStore, self).process_replication_rows(
+            stream_name, token, rows
+        )

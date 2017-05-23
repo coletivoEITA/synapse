@@ -39,7 +39,11 @@ class ApplicationServiceStoreTestCase(unittest.TestCase):
             event_cache_size=1,
             password_providers=[],
         )
-        hs = yield setup_test_homeserver(config=config)
+        hs = yield setup_test_homeserver(
+            config=config,
+            federation_sender=Mock(),
+            replication_layer=Mock(),
+        )
 
         self.as_token = "token1"
         self.as_url = "some_url"
@@ -112,7 +116,11 @@ class ApplicationServiceTransactionStoreTestCase(unittest.TestCase):
             event_cache_size=1,
             password_providers=[],
         )
-        hs = yield setup_test_homeserver(config=config)
+        hs = yield setup_test_homeserver(
+            config=config,
+            federation_sender=Mock(),
+            replication_layer=Mock(),
+        )
         self.db_pool = hs.get_db_pool()
 
         self.as_list = [
@@ -443,7 +451,12 @@ class ApplicationServiceStoreConfigTestCase(unittest.TestCase):
             app_service_config_files=[f1, f2], event_cache_size=1,
             password_providers=[]
         )
-        hs = yield setup_test_homeserver(config=config, datastore=Mock())
+        hs = yield setup_test_homeserver(
+            config=config,
+            datastore=Mock(),
+            federation_sender=Mock(),
+            replication_layer=Mock(),
+        )
 
         ApplicationServiceStore(hs)
 
@@ -456,7 +469,12 @@ class ApplicationServiceStoreConfigTestCase(unittest.TestCase):
             app_service_config_files=[f1, f2], event_cache_size=1,
             password_providers=[]
         )
-        hs = yield setup_test_homeserver(config=config, datastore=Mock())
+        hs = yield setup_test_homeserver(
+            config=config,
+            datastore=Mock(),
+            federation_sender=Mock(),
+            replication_layer=Mock(),
+        )
 
         with self.assertRaises(ConfigError) as cm:
             ApplicationServiceStore(hs)
@@ -475,7 +493,12 @@ class ApplicationServiceStoreConfigTestCase(unittest.TestCase):
             app_service_config_files=[f1, f2], event_cache_size=1,
             password_providers=[]
         )
-        hs = yield setup_test_homeserver(config=config, datastore=Mock())
+        hs = yield setup_test_homeserver(
+            config=config,
+            datastore=Mock(),
+            federation_sender=Mock(),
+            replication_layer=Mock(),
+        )
 
         with self.assertRaises(ConfigError) as cm:
             ApplicationServiceStore(hs)
